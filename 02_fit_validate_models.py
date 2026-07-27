@@ -39,11 +39,9 @@ GMST_FEATURES = [
 ENSO_TRAIN_YEARS = np.arange(1982, 2026)
 ENSO_EVENT_YEARS = np.array([1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004, 2006, 2009, 2014, 2015, 2018, 2019, 2023])
 RIDGE_WEIGHTS = (1.0, 1.5, 2.0, 3.0, 5.0, 8.0)
-RIDGE_LAMBDAS = np.geomspace(1e-3, 1e2, 18)
-GMST_WEIGHT = 1.5
-# A small positive penalty retains the ridge formulation while remaining
-# numerically close to the previously used event-weighted linear fit.
-GMST_RIDGE_LAMBDA = 1e-4
+RIDGE_LAMBDAS = np.geomspace(1e-4, 1e2, 18)
+GMST_WEIGHTS = RIDGE_WEIGHTS
+GMST_RIDGE_LAMBDAS = np.geomspace(1e-4, 1e2, 18)
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,11 +215,50 @@ def run_enso_dataset(name: str, path: Path, previous_1981: float, output: Path):
     return summary, predictions
 
 
-def fit_gmst(frame: pd.DataFrame, years: np.ndarray, event_years: np.ndarray):
+def fit_gmst(
+    frame: pd.DataFrame,
+    years: np.ndarray,
+    event_years: np.ndarray,
+    event_weight: float,
+    ridge_lambda: float,
+):
     x = frame.loc[years, GMST_FEATURES].to_numpy(float)
     y = frame.loc[years, "DELTA_CMST2_GMST"].to_numpy(float)
-    weights = np.where(np.isin(years, event_years), GMST_WEIGHT, 1.0)
-    return fit_weighted_linear(x, y, weights, GMST_RIDGE_LAMBDA)
+    weights = np.where(np.isin(years, event_years), event_weight, 1.0)
+    return fit_weighted_linear(x, y, weights, ridge_lambda)
+
+
+def tune_gmst(
+    frame: pd.DataFrame,
+    years: np.ndarray,
+    event_years: np.ndarray,
+) -> tuple[float, float]:
+    best: tuple[float, float, float] | None = None
+    selected: tuple[float, float] | None = None
+    for event_weight in GMST_WEIGHTS:
+        for ridge_lambda in GMST_RIDGE_LAMBDAS:
+            errors = []
+            for held in years:
+                train = years[years != held]
+                fit = fit_gmst(
+                    frame, train, event_years, event_weight, float(ridge_lambda)
+                )
+                prediction = apply_model(
+                    fit, frame.loc[held, GMST_FEATURES].to_numpy(float)
+                )
+                observed = float(frame.loc[held, "DELTA_CMST2_GMST"])
+                errors.append(abs(prediction - observed))
+            candidate = (
+                float(np.mean(errors)),
+                -float(ridge_lambda),
+                float(event_weight),
+            )
+            if best is None or candidate < best:
+                best = candidate
+                selected = (float(event_weight), float(ridge_lambda))
+    if selected is None:
+        raise RuntimeError("GMST hyperparameter search returned no candidate")
+    return selected
 
 
 def run_gmst_main(path: Path, enso_forecast: float, output: Path):
@@ -230,9 +267,16 @@ def run_gmst_main(path: Path, enso_forecast: float, output: Path):
     train_years = np.array([year for year in train_years if np.isfinite(frame.loc[year, GMST_FEATURES + ["DELTA_CMST2_GMST"]].to_numpy(float)).all()])
     threshold = float(frame.loc[train_years, "DELTA_CMST2_GMST"].quantile(0.75))
     event_years = train_years[frame.loc[train_years, "DELTA_CMST2_GMST"].to_numpy(float) >= threshold]
+    final_weight, final_lambda = tune_gmst(frame, train_years, event_years)
     rows = []
     for held in train_years:
-        fit = fit_gmst(frame, train_years[train_years != held], event_years)
+        fit = fit_gmst(
+            frame,
+            train_years[train_years != held],
+            event_years,
+            final_weight,
+            final_lambda,
+        )
         prediction = apply_model(fit, frame.loc[held, GMST_FEATURES].to_numpy(float))
         observed = float(frame.loc[held, "DELTA_CMST2_GMST"])
         rows.append({"year": int(held), "prediction": prediction, "observed": observed, "error": prediction - observed})
@@ -241,7 +285,9 @@ def run_gmst_main(path: Path, enso_forecast: float, output: Path):
     skill["p_value"] = student_t_pvalue(skill["correlation"], len(validation))
     skill["direction_accuracy"] = float(np.mean(np.sign(validation.prediction) == np.sign(validation.observed)))
 
-    fit = fit_gmst(frame, train_years, event_years)
+    fit = fit_gmst(
+        frame, train_years, event_years, final_weight, final_lambda
+    )
     coef, mean, std = fit
     delta_2026 = apply_model(fit, frame.loc[2026, GMST_FEATURES].to_numpy(float))
     gmst_2026 = float(frame.loc[2026, "GMST_LAG1"] + delta_2026)
@@ -257,8 +303,8 @@ def run_gmst_main(path: Path, enso_forecast: float, output: Path):
     conditional_pi = signed_interval(gmst_2027, warm_residual)
     z2027 = (forecast_frame.loc[2027, GMST_FEATURES].to_numpy(float) - mean) / std
     summary = {
-        **skill, "warm_jump_threshold": threshold, "event_weight": GMST_WEIGHT,
-        "lambda": GMST_RIDGE_LAMBDA,
+        **skill, "warm_jump_threshold": threshold, "event_weight": final_weight,
+        "lambda": final_lambda,
         "forecast_2026_delta": delta_2026, "forecast_2026_GMST": gmst_2026,
         "forecast_2027_delta": delta_2027, "forecast_2027_GMST": gmst_2027,
         "record_threshold": record, "record_probability": gaussian_exceedance(gmst_2027, record, residual),
