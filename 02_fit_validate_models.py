@@ -2,10 +2,10 @@
 """Fit, validate and forecast the ENSO and GMST models used in the paper.
 
 The ENSO experiment predicts the year-to-year change in D(0)JF Nino3.4 with
-event-weighted ridge regression.  Hyperparameters are selected inside each
-leave-one-event-out fold.  The GMST experiment uses the retained five-factor
-event-weighted ridge regression.  The script writes machine-readable
-predictions, summaries and fitted coefficients.
+event-weighted ridge regression. Hyperparameters are selected inside each
+leave-one-event-out fold. The GMST experiment uses the retained five-factor
+event-weighted regression. The script writes machine-readable predictions,
+summaries and fitted coefficients.
 
 """
 
@@ -39,9 +39,9 @@ GMST_FEATURES = [
 ENSO_TRAIN_YEARS = np.arange(1982, 2026)
 ENSO_EVENT_YEARS = np.array([1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004, 2006, 2009, 2014, 2015, 2018, 2019, 2023])
 RIDGE_WEIGHTS = (1.0, 1.5, 2.0, 3.0, 5.0, 8.0)
-RIDGE_LAMBDAS = np.geomspace(1e-4, 1e2, 18)
+RIDGE_LAMBDAS = np.r_[0.0, np.geomspace(1e-3, 1e2, 18)]
 GMST_WEIGHTS = RIDGE_WEIGHTS
-GMST_RIDGE_LAMBDAS = np.geomspace(1e-4, 1e2, 18)
+GMST_RIDGE_LAMBDAS = RIDGE_LAMBDAS.copy()
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,7 +149,7 @@ def tune_enso(df: pd.DataFrame, years: np.ndarray) -> tuple[float, float]:
                 delta = apply_model(fit, df.loc[held, ENSO_FEATURES].to_numpy(float))
                 prediction = float(df.loc[held, "PREVIOUS_NINO34_D0JF"] + delta)
                 errors.append(abs(prediction - df.loc[held, "NINO34_D0JF"]))
-            candidate = (float(np.mean(errors)), -float(ridge_lambda), float(weight))
+            candidate = (float(np.mean(errors)), float(ridge_lambda), float(weight))
             if best is None or candidate < best:
                 best = candidate
                 selected = (float(weight), float(ridge_lambda))
@@ -215,6 +215,28 @@ def run_enso_dataset(name: str, path: Path, previous_1981: float, output: Path):
     return summary, predictions
 
 
+def validate_enso_all_years(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for held in ENSO_TRAIN_YEARS:
+        train = remove_event_and_successor(ENSO_TRAIN_YEARS, int(held))
+        weight, ridge_lambda = tune_enso(df, train)
+        fit = fit_enso(df, train, weight, ridge_lambda)
+        increment = apply_model(fit, df.loc[held, ENSO_FEATURES].to_numpy(float))
+        prediction = float(df.loc[held, "PREVIOUS_NINO34_D0JF"] + increment)
+        observed = float(df.loc[held, "NINO34_D0JF"])
+        rows.append({
+            "year": int(held),
+            "observed": observed,
+            "prediction": prediction,
+            "error": prediction - observed,
+            "is_elnino": bool(observed >= 0.5),
+            "event_weight": weight,
+            "lambda": ridge_lambda,
+            "validation_protocol": "leave_target_and_successor_out",
+        })
+    return pd.DataFrame(rows)
+
+
 def fit_gmst(
     frame: pd.DataFrame,
     years: np.ndarray,
@@ -250,7 +272,7 @@ def tune_gmst(
                 errors.append(abs(prediction - observed))
             candidate = (
                 float(np.mean(errors)),
-                -float(ridge_lambda),
+                float(ridge_lambda),
                 float(event_weight),
             )
             if best is None or candidate < best:
@@ -340,6 +362,14 @@ def main() -> None:
         summary, validation = run_enso_dataset(name, path, previous, args.output)
         summaries.append(summary)
         validations.append(validation)
+        if name == "ersstv6":
+            frame = pd.read_csv(path).set_index("year").sort_index()
+            all_year = validate_enso_all_years(make_enso_increment_table(frame, previous))
+            all_year.to_csv(
+                args.output / "enso_ersstv6_all_year_validation.csv",
+                index=False,
+                float_format="%.9g",
+            )
     pd.DataFrame(summaries).to_csv(args.output / "enso_sensitivity_summary.csv", index=False, float_format="%.9g")
     pd.concat(validations, ignore_index=True).to_csv(args.output / "enso_all_validation.csv", index=False, float_format="%.9g")
 

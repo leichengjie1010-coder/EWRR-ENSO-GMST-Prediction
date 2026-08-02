@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the manuscript and supplementary figures from model output.
-
-The plotting code is deliberately separated from calculation.  It reads only
-CSV/JSON products written by ``02_fit_validate_models.py`` plus the archived
-diagnostic and sensitivity tables used in the Supplementary Information.
-
-"""
+"""Reproduce the final ENSO-GMST figure from the fitted model products."""
 
 from __future__ import annotations
 
@@ -20,7 +14,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import FancyArrowPatch, Patch
+from matplotlib.path import Path as MarkerPath
+from scipy import stats
 
 
 PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
@@ -28,19 +24,26 @@ DEFAULT_INPUT = PROJECT_ROOT / "数据" / "code_reproduction" / "models"
 DEFAULT_PREPARED = PROJECT_ROOT / "数据" / "code_reproduction" / "prepared"
 DEFAULT_OUTPUT = PROJECT_ROOT / "图件" / "code_reproduction"
 
-EVENT_YEARS = np.array([1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004, 2006, 2009, 2014, 2015, 2018, 2019, 2023])
-STRONG_YEARS = {1982, 1991, 1997, 2015, 2023}
-WARM_JUMP_YEARS = {1981, 1983, 1987, 1988, 1990, 1995, 1997, 1998, 2002, 2009, 2010, 2014, 2015, 2016, 2023}
-
+EVENT_YEARS = np.array([
+    1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004,
+    2006, 2009, 2014, 2015, 2018, 2019, 2023,
+])
 BLACK = "#111827"
-GRAY = "#C4C5C5"
-DARK_GRAY = "#50514A"
-ORANGE = "#ED963A"
+OBS_BLUE = "#2F779F"
+PALE_BLUE = "#DAE8F6"
+ORANGE = "#ED7640"
 LIGHT_ORANGE = "#F6B36D"
-RED = "#DA5427"
-CYAN = "#5DC8F5"
-BLUE = "#77B5E8"
-PALE_BLUE = "#DBEAFE"
+POST_ORANGE = "#DF6035"
+RED = "#FF0000"
+GRAY = "#D1D5DB"
+PEACOCK = "#2F779F"
+FORECAST_SHADE = "#FCE8E8"
+BASELINE_SHIFT = 0.321
+
+CHECK_MARKER = MarkerPath(
+    [(-0.72, -0.02), (-0.22, -0.55), (0.76, 0.62)],
+    [MarkerPath.MOVETO, MarkerPath.LINETO, MarkerPath.LINETO],
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,291 +56,576 @@ def parse_args() -> argparse.Namespace:
 
 def setup_style() -> None:
     mpl.rcParams.update({
-        "font.family": "DejaVu Sans", "font.size": 10.8, "font.weight": "semibold",
-        "axes.labelsize": 12, "axes.labelweight": "bold", "axes.linewidth": 1.0,
-        "xtick.labelsize": 9.5, "ytick.labelsize": 9.5, "legend.fontsize": 9.2,
-        "axes.spines.top": False, "axes.spines.right": False,
-        "figure.dpi": 180, "savefig.dpi": 450, "pdf.fonttype": 42,
-        "ps.fonttype": 42, "svg.fonttype": "none",
+        "font.family": "DejaVu Sans",
+        "font.size": 12.0,
+        "font.weight": "semibold",
+        "axes.labelsize": 13.3,
+        "axes.labelweight": "bold",
+        "axes.linewidth": 1.05,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "xtick.labelsize": 10.8,
+        "ytick.labelsize": 10.8,
+        "legend.fontsize": 11.0,
+        "figure.dpi": 180,
+        "savefig.dpi": 450,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
     })
-
-
-def panel_label(fig: plt.Figure, ax: plt.Axes, label: str, dx: float = -0.020, dy: float = 0.020) -> None:
-    box = ax.get_position()
-    fig.text(box.x0 + dx, box.y1 + dy, label, ha="center", va="center",
-             color="white", fontsize=13, fontweight="bold",
-             bbox=dict(boxstyle="circle,pad=0.33", fc=BLACK, ec="none"), zorder=50)
-
-
-def metric_box(ax: plt.Axes, lines: list[str]) -> None:
-    ax.text(0.045, 0.95, "\n".join(lines), transform=ax.transAxes, ha="left", va="top",
-            fontsize=8.8, color=BLACK, linespacing=1.28,
-            bbox=dict(boxstyle="round,pad=0.32,rounding_size=0.04", fc="white", ec="#D8DEE8", alpha=0.88))
-
-
-def save_figure(fig: plt.Figure, base: Path) -> None:
-    for suffix in ("png", "pdf", "svg"):
-        fig.savefig(base.with_suffix(f".{suffix}"), bbox_inches="tight", facecolor="white")
-    plt.close(fig)
 
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def draw_enso_scatter(ax: plt.Axes, validation: pd.DataFrame, summary: dict) -> None:
-    low, high = -2.0, 3.0
-    x = np.linspace(low, high, 200)
-    ax.fill_between(x, x - 0.5, x + 0.5, color=PALE_BLUE, alpha=0.75)
-    ax.plot(x, x, color=BLACK, lw=1.3)
-    ax.plot(x, x - 0.5, color="#7FB9FF", lw=0.9, ls="--")
-    ax.plot(x, x + 0.5, color="#7FB9FF", lw=0.9, ls="--")
-    values = validation.observed.to_numpy(float)
-    colors = plt.cm.OrRd(0.30 + 0.65 * (values - values.min()) / (values.max() - values.min()))
-    ax.scatter(validation.observed, validation.prediction, s=42, c=colors, edgecolors="none", zorder=5)
-    for year in (2002, 2009):
-        row = validation.loc[validation.heldout_event.eq(year)].iloc[0]
-        ax.text(row.observed, row.prediction + 0.16, str(year), color=ORANGE,
-                ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-    ax.set_xlim(low, high); ax.set_ylim(low, high); ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("Observed Niño3.4 D(0)JF index (°C)")
-    ax.set_ylabel("Hindcast Niño3.4 D(0)JF index (°C)")
-    p = summary.get("p_value", np.nan)
-    metric_box(ax, [f"r = {summary['correlation']:.3f}", f"p = {p:.2e}",
-                    f"MAE = {summary['MAE']:.3f}°C", f"RMSE = {summary['RMSE']:.3f}°C"])
+def panel_label(fig: plt.Figure, ax: plt.Axes, label: str, dy: float = 0.014) -> None:
+    box = ax.get_position()
+    fig.text(
+        box.x0 - 0.018, box.y1 + dy, label,
+        ha="center", va="center", color="white", fontsize=18.4,
+        fontweight="bold",
+        bbox=dict(boxstyle="circle,pad=0.34", fc=BLACK, ec="none"),
+        zorder=60,
+    )
 
 
-def draw_enso_bars(ax: plt.Axes, validation: pd.DataFrame, model: dict) -> None:
-    years = validation.heldout_event.astype(int).tolist()
-    x = np.arange(len(years))
-    w = 0.36
-    ax.bar(x - w / 2, validation.observed, width=w, color=GRAY, edgecolor="none", label="Observed")
-    ax.bar(x + w / 2, validation.prediction, width=w, color=LIGHT_ORANGE, edgecolor="none", label="Hindcast")
-    forecast = model["summary"]["forecast_2026_D0JF"]
-    ax.bar(len(years), forecast, width=w, color=RED, edgecolor="none", label="Forecast")
-    ax.text(len(years), forecast + 0.10, f"{forecast:.2f}°C", color=RED, ha="center", fontweight="bold")
-    ax.axhline(1.5, color="#F39C34", lw=1.1, ls=(0, (5, 4)))
-    ax.axhline(0.5, color="#9AA9BC", lw=0.9, ls=(0, (3, 4)), alpha=0.8)
-    ax.set_xticks(np.arange(len(years) + 1)); ax.set_xticklabels([*map(str, years), "2026"], rotation=45, ha="right")
-    ax.set_ylabel("Niño3.4 D(0)JF index (°C)")
-    ax.legend(loc="upper left", frameon=True, facecolor="white", edgecolor="#D8DEE8")
+def sci_p(p: float) -> str:
+    if p >= 0.001:
+        return f"p = {p:.3f}"
+    exponent = int(math.floor(math.log10(p)))
+    mantissa = p / 10**exponent
+    return f"p = {mantissa:.2f}×10$^{{{exponent}}}$"
 
 
-def figure_enso(input_dir: Path, output: Path) -> None:
-    validation = pd.read_csv(input_dir / "enso_ersstv6_validation.csv")
-    model = read_json(input_dir / "enso_ersstv6_model.json")
-    fig, axes = plt.subplots(1, 2, figsize=(14.8, 5.9), gridspec_kw={"width_ratios": [1.05, 1.58], "wspace": 0.22})
-    draw_enso_scatter(axes[0], validation, model["summary"])
-    draw_enso_bars(axes[1], validation, model)
-    fig.subplots_adjust(left=0.075, right=0.985, top=0.89, bottom=0.17)
-    panel_label(fig, axes[0], "a", dy=0.026); panel_label(fig, axes[1], "b", dy=0.026)
-    save_figure(fig, output / "figure_ENSO_two_panel_ab")
+def metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
+    error = predicted - observed
+    result = {
+        "r": float(np.corrcoef(observed, predicted)[0, 1]),
+        "MAE": float(np.mean(np.abs(error))),
+        "RMSE": float(np.sqrt(np.mean(error**2))),
+    }
+    result["p"] = float(stats.pearsonr(observed, predicted).pvalue)
+    return result
 
 
-def gmst_series(prepared: Path, validation: pd.DataFrame) -> pd.DataFrame:
+def metric_box(ax: plt.Axes, result: dict[str, float], loc=(0.04, 0.95)) -> None:
+    text = (
+        f"r = {result['r']:.3f}\n{sci_p(result['p'])}\n"
+        f"MAE = {result['MAE']:.3f}°C\nRMSE = {result['RMSE']:.3f}°C"
+    )
+    ax.text(
+        *loc, text, transform=ax.transAxes, ha="left", va="top",
+        fontsize=12.8, color=BLACK, linespacing=1.25,
+        bbox=dict(boxstyle="square,pad=0.35", fc="white", ec="#D8DEE8", alpha=0.92),
+        zorder=20,
+    )
+
+
+def event_styles(event_validation: pd.DataFrame) -> dict[int, tuple[float, str]]:
+    ordered = event_validation.sort_values("observed", ascending=False).reset_index(drop=True)
+    values = event_validation["observed"].to_numpy(float)
+    scale = (values - values.min()) / max(1e-12, values.max() - values.min())
+    sizes = 115 + scale**1.15 * 370
+    size_map = dict(zip(event_validation.heldout_event.astype(int), sizes))
+    dark = np.array(mpl.colors.to_rgb("#8F1D1D"))
+    light = np.array(mpl.colors.to_rgb(LIGHT_ORANGE))
+    styles = {}
+    for rank, row in ordered.iterrows():
+        fraction = rank / max(1, len(ordered) - 1)
+        color = mpl.colors.to_hex(dark * (1 - fraction) + light * fraction)
+        year = int(row.heldout_event)
+        styles[year] = (float(size_map[year]), color)
+    return styles
+
+
+def gmst_series(prepared: Path, validation: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     frame = pd.read_csv(prepared / "gmst_annual_model_frame.csv").set_index("year")
     result = validation.set_index("year").copy()
     result["observed_gmst"] = frame.loc[result.index, "CMST2_GMST"]
     result["hindcast_gmst"] = frame.loc[result.index, "GMST_LAG1"] + result.prediction
-    return result.reset_index()
+    return result.reset_index(), frame
 
 
-def draw_gmst_scatter(ax: plt.Axes, validation: pd.DataFrame, summary: dict) -> None:
-    low, high = -0.2, 0.42
-    x = np.linspace(low, high, 200)
-    ax.fill_between(x, x - 0.1, x + 0.1, color=PALE_BLUE, alpha=0.8)
-    ax.plot(x, x, color=BLACK, lw=1.25)
-    ax.plot(x, x - 0.1, color="#7FB9FF", lw=0.9, ls="--")
-    ax.plot(x, x + 0.1, color="#7FB9FF", lw=0.9, ls="--")
-    colors = [ORANGE if int(y) in WARM_JUMP_YEARS else CYAN for y in validation.year]
-    ax.scatter(validation.observed, validation.prediction, c=colors, s=30, edgecolors="none", zorder=4)
-    for year in (1981, 1992, 2023):
-        row = validation.loc[validation.year.eq(year)].iloc[0]
-        ax.text(row.observed, row.prediction + 0.018, str(year), color=colors[list(validation.year).index(year)],
-                ha="center", fontsize=8.2, fontweight="bold")
-    ax.set_xlim(low, high); ax.set_ylim(low, high); ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("Observed ΔGMST (°C)"); ax.set_ylabel("Predicted ΔGMST (°C)")
-    metric_box(ax, [f"r = {summary['correlation']:.3f}", f"p = {summary['p_value']:.2e}",
-                    f"MAE = {summary['MAE']:.3f}°C", f"RMSE = {summary['RMSE']:.3f}°C"])
-    ax.legend(handles=[Line2D([], [], marker="o", ls="", color=ORANGE, label="Warm-jump years"),
-                       Line2D([], [], marker="o", ls="", color=CYAN, label="Other years")],
-              loc="lower right", frameon=True, facecolor="white", edgecolor="#D8DEE8")
+def post_elnino_records(series: pd.DataFrame, include_2027: float | None = None) -> list[tuple[int, float]]:
+    values = {
+        int(row.year): float(row.hindcast_gmst)
+        for row in series.itertuples()
+        if int(row.year) in set(EVENT_YEARS + 1)
+    }
+    if include_2027 is not None:
+        values[2027] = float(include_2027)
+    records = []
+    running = -np.inf
+    for year in sorted(values):
+        if values[year] > running:
+            records.append((year, values[year]))
+            running = values[year]
+    return records
 
 
-def draw_gmst_time_series(ax: plt.Axes, series: pd.DataFrame, model: dict) -> None:
-    years = series.year.to_numpy(int)
-    event = set(EVENT_YEARS.tolist())
-    post = {year + 1 for year in event}
-    colors = [LIGHT_ORANGE if y in event else RED if y in post else GRAY for y in years]
-    ax.bar(years, series.hindcast_gmst, width=0.67, color=colors, edgecolor="none", alpha=0.88)
-    ax.plot(years, series.observed_gmst, color="black", lw=1.45, label="Observed CMST2.0")
-    s = model["summary"]
-    ax.plot([2025, 2026, 2027], [series.loc[series.year.eq(2025), "observed_gmst"].iloc[0],
-                                 s["forecast_2026_GMST"], s["forecast_2027_GMST"]],
-            color="#A61E2D", lw=1.6, ls="--")
-    ax.scatter([2026, 2027], [s["forecast_2026_GMST"], s["forecast_2027_GMST"]],
-               marker="*", s=95, color="#A61E2D", zorder=8)
-    ax.text(2026.05, s["forecast_2026_GMST"] - 0.06, "2026", color="#A61E2D", fontweight="bold")
-    ax.text(2027, s["forecast_2027_GMST"] + 0.05, "2027", color="#A61E2D", ha="center", fontweight="bold")
-    ax.axhline(s["record_threshold"], color="#F39C34", lw=1.1, ls=(0, (5, 4)))
-    ax.text(2007, s["record_threshold"] + 0.03, "2024 GMST: 1.194°C", color="#A61E2D", fontweight="bold")
-    ax.axhline(0, color=BLACK, lw=0.9, ls=(0, (5, 4)))
-    ax.text(0.98, 0.02, "Base period 1961–1990", transform=ax.transAxes, ha="right", fontweight="bold")
-    ax.set_xlim(1980.2, 2027.8); ax.set_ylim(-0.1, 1.5)
-    ax.set_ylabel("Annual mean GMST anomaly (°C)")
-    ax.legend(handles=[Line2D([], [], color="black", label="Observed CMST2.0"),
-                       Line2D([], [], marker="*", ls="", color="#A61E2D", label="Forecast"),
-                       Patch(color=LIGHT_ORANGE, label="El Niño-year"), Patch(color=RED, label="Post-El Niño"),
-                       Patch(color=GRAY, label="Other years")], ncol=3, loc="upper left",
-              frameon=True, facecolor="white", edgecolor="#D8DEE8")
+def panel_a(ax: plt.Axes, all_year: pd.DataFrame, forecast: float) -> None:
+    years = all_year.year.to_numpy(int)
+    ax.axvspan(2025.5, 2027.0, color=FORECAST_SHADE, zorder=0)
+    observed_bars = ax.bar(
+        years, all_year.observed, width=0.72, color=OBS_BLUE,
+        edgecolor="none", alpha=0.97, zorder=2,
+    )
+    hindcast_line, = ax.plot(
+        years, all_year.prediction, color=ORANGE, marker="o", ms=6.4,
+        markerfacecolor=ORANGE, markeredgecolor=ORANGE, lw=2.6,
+        zorder=4,
+    )
+    forecast_bar = ax.bar([2026], [forecast], width=0.72, color=RED,
+                          edgecolor="none", zorder=5)
+    ax.axhline(0, color="#9CA3AF", lw=0.85, zorder=1)
+    ax.set_xlim(1980.7, 2027.1)
+    ax.set_ylim(-2.0, 3.0)
+    ticks = [1981, 1990, 2000, 2010, 2020, 2026]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(
+        ["1981/1982", "1990/1991", "2000/2001", "2010/2011", "2020/2021", "2026/2027"],
+        rotation=36, ha="right",
+    )
+    ax.get_xticklabels()[-1].set_color(RED)
+    ax.get_xticklabels()[-1].set_fontweight("bold")
+    ax.set_ylabel("Niño3.4 D(0)JF (°C)")
+    result = metrics(all_year.observed.to_numpy(float), all_year.prediction.to_numpy(float))
+    header = (
+        "Leave-one-event-out validation      "
+        f"r = {result['r']:.3f}      {sci_p(result['p'])}      "
+        f"MAE = {result['MAE']:.3f}°C      RMSE = {result['RMSE']:.3f}°C"
+    )
+    ax.text(0.015, 1.06, header, transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=14.1, fontweight="bold", clip_on=False)
+    history_legend = ax.legend(
+        [observed_bars[0], hindcast_line], ["Observed", "Hindcast"],
+        loc="lower left", bbox_to_anchor=(0.0, -0.005), frameon=False,
+        ncol=2, handlelength=2.0, columnspacing=1.8, fontsize=13.0,
+    )
+    ax.add_artist(history_legend)
+    forecast_legend = ax.legend(
+        [forecast_bar[0]], ["2026 Forecast"],
+        loc="lower right", bbox_to_anchor=(0.995, -0.005), frameon=False,
+        handlelength=2.0, fontsize=13.0,
+    )
+    for text in [*history_legend.get_texts(), *forecast_legend.get_texts()]:
+        text.set_fontweight("bold")
+    bubble = ax.text(
+        2026, forecast + 0.48, f"{forecast:.3f}°C",
+        color=RED, fontsize=13.7, fontweight="bold", ha="center", va="center",
+        bbox=dict(boxstyle="circle,pad=0.75", fc="#FFE7E7", ec="#FFAAAA"),
+        clip_on=False, zorder=15,
+    )
+    record = ax.text(
+        2026, forecast + 1.08, "Record-breaking", color=RED,
+        fontsize=13.5, fontweight="bold", ha="center", va="bottom",
+        clip_on=False, zorder=15,
+    )
+    ax._forecast_bubble = bubble
+    ax._forecast_record = record
 
 
-def draw_gmst_probability(ax: plt.Axes, validation: pd.DataFrame, model: dict) -> None:
-    residual = validation.error.to_numpy(float)
-    forecast = model["summary"]["forecast_2027_GMST"]
+def overlay_event_status(
+    ax: plt.Axes, x: float, y: float, size: float,
+    positive: bool, record: bool,
+) -> None:
+    if positive:
+        ax.scatter([x], [y], s=size * 1.08, facecolors="none", edgecolors=BLACK,
+                   linewidths=1.7, zorder=7)
+    if record:
+        ax.scatter([x], [y], s=size * 0.30, marker=CHECK_MARKER,
+                   facecolors="none", edgecolors="white", linewidths=2.1, zorder=8)
+    elif not positive:
+        ax.scatter([x], [y], s=size * 0.22, marker="x", color="white",
+                   linewidths=2.1, zorder=8)
+
+
+def panel_b(
+    ax: plt.Axes, key_ax: plt.Axes, all_year: pd.DataFrame,
+    events: pd.DataFrame, gmst: pd.DataFrame,
+) -> None:
+    low, high = -2.0, 3.0
+    grid = np.linspace(low, high, 300)
+    ax.fill_between(grid, grid - 0.5, grid + 0.5, color=PALE_BLUE, zorder=0)
+    ax.plot(grid, grid, color=BLACK, lw=1.3)
+    ax.plot(grid, grid - 0.5, color="#8ABBE4", lw=0.85, ls="--")
+    ax.plot(grid, grid + 0.5, color="#8ABBE4", lw=0.85, ls="--")
+    event_set = set(events.heldout_event.astype(int))
+    other = ~all_year.year.astype(int).isin(event_set)
+    ax.scatter(all_year.loc[other, "observed"], all_year.loc[other, "prediction"],
+               s=58, color=GRAY, alpha=0.82, edgecolors="none", zorder=2)
+    styles = event_styles(events)
+    record_years = {year for year, _ in post_elnino_records(gmst)}
+    gmst_by_year = gmst.set_index("year")
+    for row in events.itertuples():
+        year = int(row.heldout_event)
+        size, color = styles[year]
+        ax.scatter([row.observed], [row.prediction], s=size, color=color,
+                   edgecolors="none", zorder=5)
+        post = year + 1
+        positive = post in gmst_by_year.index and float(gmst_by_year.loc[post, "observed"]) > 0
+        overlay_event_status(ax, row.observed, row.prediction, size, positive, post in record_years)
+    for year, offset in ((2002, (10, -18)), (2009, (10, 7))):
+        row = events.loc[events.heldout_event.eq(year)].iloc[0]
+        ax.annotate(str(year), (row.observed, row.prediction), xytext=offset,
+                    textcoords="offset points", color=styles[year][1],
+                    fontsize=11.0, fontweight="bold")
+    ax.set_xlim(low, high)
+    ax.set_ylim(low, high)
+    ax.set_box_aspect(0.72)
+    ax.set_xlabel("Observed Niño3.4 D(0)JF index (°C)")
+    ax.set_ylabel("Hindcast Niño3.4 D(0)JF (°C)")
+    metric_box(ax, metrics(events.observed.to_numpy(float), events.prediction.to_numpy(float)))
+
+    key_ax.set_axis_off()
+    key_ax.set_xlim(0, 1)
+    key_ax.set_ylim(0, 1)
+    key_ax.text(0.05, 1.015, "El Niño", ha="left", va="top",
+                fontsize=15.0, color=BLACK, fontweight="bold")
+    ordered = events.sort_values("observed", ascending=False)
+    y_positions = np.linspace(0.91, 0.05, len(ordered))
+    for y, row in zip(y_positions, ordered.itertuples()):
+        year = int(row.heldout_event)
+        size, color = styles[year]
+        key_ax.scatter([0.10], [y], s=size * 0.57, color=color, edgecolors="none")
+        post = year + 1
+        positive = post in gmst_by_year.index and float(gmst_by_year.loc[post, "observed"]) > 0
+        overlay_event_status(key_ax, 0.10, y, size * 0.57, positive, post in record_years)
+        key_ax.text(0.24, y, f"{year}/{year + 1}", ha="left", va="center",
+                    fontsize=11.5, color=color, fontweight="bold")
+
+
+def gaussian_panel(
+    ax: plt.Axes, possible: np.ndarray, threshold: float,
+    title: str, xlabel: str, probability: float, bar_fraction: float = 0.78,
+) -> None:
+    counts, edges = np.histogram(possible, bins=10)
+    width = edges[1] - edges[0]
+    ax.bar(0.5 * (edges[:-1] + edges[1:]), counts, width=width * bar_fraction,
+           color=PEACOCK, edgecolor="none", alpha=0.93, zorder=2)
+    mu, sd = float(possible.mean()), float(possible.std(ddof=1))
+    grid = np.linspace(min(possible) - width, max(possible) + width, 500)
+    curve = np.exp(-0.5 * ((grid - mu) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+    curve = curve / curve.max() * (max(counts) + 0.8)
+    ax.plot(grid, curve, color=BLACK, lw=1.8, zorder=4)
+    rng = np.random.default_rng(2027)
+    ax.scatter(possible, -0.20 + rng.uniform(-0.025, 0.025, len(possible)),
+               s=20, color=RED, edgecolors="none", zorder=5)
+    ax.axvline(threshold, color=RED, lw=1.55, ls=(0, (5, 4)))
+    ax.text(threshold - 0.012, 0.93, f"Record P:\n{probability * 100:.1f}%",
+            transform=ax.get_xaxis_transform(), ha="right", va="top",
+            fontsize=13.0, color=RED, fontweight="bold")
+    ax.set_title(title, loc="left", x=0.04, fontsize=13.2, fontweight="bold", pad=10)
+    ax.set_xlabel(xlabel, color=RED, fontsize=13.1)
+    ax.set_ylabel("Count")
+    ax.tick_params(axis="x", colors=RED)
+    ax.spines["bottom"].set_color(BLACK)
+    ax.set_ylim(-0.45, max(counts) + 2.0)
+
+
+def panel_c(ax: plt.Axes, all_year: pd.DataFrame, forecast: float, record: float) -> None:
+    residual = np.abs(all_year.prediction.to_numpy(float)) - np.abs(all_year.observed.to_numpy(float))
     possible = forecast - residual
-    ax.hist(possible, bins=10, color=GRAY, edgecolor="white", alpha=0.95)
-    mean, std = possible.mean(), possible.std(ddof=1)
-    x = np.linspace(min(possible) - 0.04, max(possible) + 0.04, 300)
-    density = np.exp(-0.5 * ((x - mean) / std) ** 2) / (std * math.sqrt(2 * math.pi))
-    bin_width = (possible.max() - possible.min()) / 10
-    ax.plot(x, density * len(possible) * bin_width, color=BLACK, lw=1.8)
-    record = model["summary"]["record_threshold"]
-    ax.axvline(record, color=ORANGE, lw=1.4, ls=(0, (5, 4)))
-    ax.text(record + 0.006, ax.get_ylim()[1] * 0.78, "Record threshold", rotation=90,
-            color=DARK_GRAY, fontweight="bold")
-    ax.text(0.06, 0.92, f"Gaussian P = {100 * model['summary']['record_probability']:.1f}%",
-            transform=ax.transAxes, ha="left", va="top", color=DARK_GRAY, fontweight="bold")
-    ax.scatter(possible, np.zeros_like(possible), color=GRAY, s=12, edgecolors="none", zorder=4)
-    ax.set_xlabel("Possible 2027 GMST from all-year residuals (°C)"); ax.set_ylabel("Count")
+    mu, sd = float(residual.mean()), float(residual.std(ddof=1))
+    probability = float(stats.norm.cdf((forecast - record - mu) / sd))
+    gaussian_panel(
+        ax, possible, record,
+        f"All historical years: |Niño3.4| residuals (n = {len(residual)})",
+        "Possible 2026/2027 Niño3.4 (°C)", probability, bar_fraction=0.55,
+    )
+    strong_p = float(stats.norm.cdf((forecast - 1.5 - mu) / sd))
+    ax.axvline(1.5, color=RED, lw=1.45, ls=(0, (5, 4)))
+    ax.text(1.5 - 0.04, 0.93, f"Strong P:\n{strong_p * 100:.1f}%",
+            transform=ax.get_xaxis_transform(), ha="right", va="top",
+            fontsize=13.0, color=RED, fontweight="bold")
+    ymax = ax.get_ylim()[1]
+    ax.text(1.5, ymax * 0.27, "1.5°C", color=RED, rotation=90,
+            ha="left", va="center", fontsize=10.5, fontweight="bold")
+    ax.text(record, ymax * 0.27, "Record", color=RED, rotation=90,
+            ha="left", va="center", fontsize=10.5, fontweight="bold")
 
 
-def draw_gmst_contributions(ax: plt.Axes, model: dict) -> None:
-    labels = {"GMST_LAG1": "Lagged GMST", "GLOBAL_SST_ERSSTv6_LAG1": "Global SST",
-              "ERF_WMGHG_LAG1": "GHG forcing", "NINO34_DJF_ENDING_YEAR": "Niño3.4",
-              "IPO_TPI_LAG1": "TPI"}
-    order = ["GMST_LAG1", "GLOBAL_SST_ERSSTv6_LAG1", "ERF_WMGHG_LAG1", "NINO34_DJF_ENDING_YEAR", "IPO_TPI_LAG1"]
-    values = [model["contribution_2027"][key] for key in order] + [model["intercept_delta"]]
-    names = [labels[key] for key in order] + ["Intercept"]
-    colors = [CYAN if v < 0 else ORANGE for v in values[:-1]] + [GRAY]
-    y = np.arange(len(names))
-    ax.barh(y, values, color=colors, height=0.62, edgecolor="none")
-    ax.axvline(0, color=BLACK, lw=1)
-    for yi, value, color in zip(y, values, colors):
-        if value < 0:
-            # Keep the value inside the negative bar so it cannot collide with
-            # the predictor label on the left-hand side of the axis.
-            x_text, align, text_color = value + 0.025, "left", "white"
+def gmst_record_styles(series: pd.DataFrame, years: list[int]) -> dict[int, tuple[float, str]]:
+    values = np.array([series.loc[series.year.eq(year), "hindcast_gmst"].iloc[0] for year in years])
+    order = np.argsort(values)[::-1]
+    dark = np.array(mpl.colors.to_rgb("#B52A2A"))
+    light = np.array(mpl.colors.to_rgb("#F06464"))
+    styles = {}
+    for rank, index in enumerate(order):
+        fraction = rank / max(1, len(order) - 1)
+        styles[years[index]] = (200 - 65 * fraction, mpl.colors.to_hex(dark * (1 - fraction) + light * fraction))
+    return styles
+
+
+def panel_d(ax: plt.Axes, key_ax: plt.Axes, series: pd.DataFrame, summary: dict) -> None:
+    observed = series.observed.to_numpy(float)
+    predicted = series.prediction.to_numpy(float)
+    low, high = -0.18, 0.42
+    grid = np.linspace(low, high, 300)
+    ax.fill_between(grid, grid - 0.1, grid + 0.1, color=PALE_BLUE, zorder=0)
+    ax.plot(grid, grid, color=BLACK, lw=1.3)
+    record_years = [year for year, _ in post_elnino_records(series)]
+    record_set = set(record_years)
+    warm = set(series.loc[series.observed >= summary["warm_jump_threshold"], "year"].astype(int))
+    other = ~series.year.astype(int).isin(record_set | warm)
+    ax.scatter(series.loc[other, "observed"], series.loc[other, "prediction"],
+               s=62, color=PEACOCK, alpha=0.72, edgecolors="none", zorder=2)
+    warm_only = series.year.astype(int).isin(warm - record_set)
+    ax.scatter(series.loc[warm_only, "observed"], series.loc[warm_only, "prediction"],
+               s=92, color=ORANGE, edgecolors="none", zorder=4)
+    styles = gmst_record_styles(series, record_years)
+    for year in record_years:
+        row = series.loc[series.year.eq(year)].iloc[0]
+        size, color = styles[year]
+        ax.scatter([row.observed], [row.prediction], s=size, color=color,
+                   edgecolors="none", zorder=5)
+    for year in (1981, 1992, 2023):
+        row = series.loc[series.year.eq(year)]
+        if not row.empty:
+            ax.annotate(str(year), (row.observed.iloc[0], row.prediction.iloc[0]),
+                        xytext=(0, 9), textcoords="offset points", ha="center",
+                        fontsize=9.8, fontweight="bold",
+                        color=ORANGE if year == 2023 else PEACOCK)
+    ax.set_xlim(low, high)
+    ax.set_ylim(low, high)
+    ax.set_box_aspect(0.72)
+    ax.set_xlabel("Observed ΔGMST (°C)")
+    ax.set_ylabel("Hindcast ΔGMST (°C)")
+    metric_box(ax, metrics(observed, predicted))
+
+    key_ax.set_axis_off()
+    key_ax.set_xlim(0, 1)
+    key_ax.set_ylim(0, 1)
+    key_ax.text(0.05, 1.015, "Record", ha="left", va="top",
+                fontsize=15.0, fontweight="bold", color=BLACK)
+    y_positions = np.linspace(0.91, 0.35, len(record_years))
+    for y, year in zip(y_positions, reversed(record_years)):
+        size, color = styles[year]
+        key_ax.scatter([0.10], [y], s=size * 0.70, color=color, edgecolors="none")
+        key_ax.text(0.24, y, str(year), ha="left", va="center",
+                    fontsize=11.5, color=color, fontweight="bold")
+    key_ax.text(0.05, 0.27, "Warm jump", fontsize=13.3, fontweight="bold", color=BLACK)
+    key_ax.scatter([0.10], [0.20], s=75, color=ORANGE, edgecolors="none")
+    key_ax.text(0.05, 0.12, "Other", fontsize=13.3, fontweight="bold", color=BLACK)
+    key_ax.scatter([0.10], [0.05], s=62, color=PEACOCK, edgecolors="none")
+
+
+def panel_e(
+    ax: plt.Axes, series: pd.DataFrame, frame: pd.DataFrame, model: dict,
+) -> None:
+    summary = model["summary"]
+    years = series.year.to_numpy(int)
+    event = set(EVENT_YEARS)
+    post = {year + 1 for year in event}
+    colors = []
+    for year in years:
+        if year == 1992:
+            colors.append("#4A84BD")
+        elif year in event:
+            colors.append(LIGHT_ORANGE)
+        elif year in post:
+            colors.append(POST_ORANGE)
         else:
-            x_text, align, text_color = value + 0.025, "left", color
-        ax.text(x_text, yi, f"{value:+.3f}", ha=align, va="center",
-                color=text_color, fontweight="bold", fontsize=8.5)
-    ax.set_yticks(y); ax.set_yticklabels(names); ax.invert_yaxis()
-    ax.set_xlabel("Contribution to 2027 ΔGMST (°C)")
+            colors.append("#C7C9C9")
+    ax.bar(years, series.hindcast_gmst, width=0.62, color=colors,
+           edgecolor="none", alpha=0.92, zorder=2)
+    ax.plot(years, series.observed_gmst, color="black", marker="o", ms=3.8,
+            lw=2.0, label="Observed GMST", zorder=5)
+    f2026 = float(summary["forecast_2026_GMST"])
+    f2027 = float(summary["forecast_2027_GMST"])
+    ax.plot([2025, 2026, 2027], [float(frame.loc[2025, "CMST2_GMST"]), f2026, f2027],
+            color=RED, lw=1.8, ls="--", zorder=6)
+    ax.scatter([2026], [f2026], marker="*", s=330, color="#3575D3",
+               edgecolors="white", linewidths=0.7, zorder=8)
+    ax.scatter([2027], [f2027], marker="*", s=330, color=RED,
+               edgecolors="white", linewidths=0.7, zorder=8)
+    ax.axvspan(2025.5, 2030, ymin=0, ymax=(1.70 - BASELINE_SHIFT) / (1.8 - BASELINE_SHIFT),
+               color="#F5E7DB", zorder=0)
+    threshold_native = 1.5 - BASELINE_SHIFT
+    ax.plot([2005, 2030], [threshold_native, threshold_native], color=RED,
+            lw=2.1, ls=(0, (5, 4)), zorder=4)
+    ax.text(2005.3, threshold_native + 0.025, "1.5°C threshold", color=RED,
+            fontsize=12.3, fontweight="bold")
+    records = post_elnino_records(series, f2027)
+    for (year0, value0), (year1, value1) in zip(records[:-1], records[1:]):
+        level = max(value0, value1) + 0.035
+        if year1 == 2027:
+            level = value1 - 0.015
+        end = year1 - 0.35 if year1 == 2027 else year1
+        line = dict(color=POST_ORANGE, lw=1.75, ls=(0, (3, 3)), zorder=6)
+        ax.plot([year0, year0], [value0 + 0.012, level + 0.018], **line)
+        ax.plot([year1, year1], [value1 + 0.012, level + 0.018], **line)
+        ax.annotate("", xy=(end, level), xytext=(year0, level),
+                    arrowprops=dict(arrowstyle="-|>", color=POST_ORANGE,
+                                    lw=1.75, linestyle=(0, (3, 3)), mutation_scale=11))
+        ax.text((year0 + year1) / 2, level + 0.023, f"+{value1 - value0:.2f}°C",
+                ha="center", va="bottom", color=POST_ORANGE,
+                fontsize=9.4, fontweight="bold")
+    ax.set_xlim(1980.3, 2030)
+    ax.set_ylim(0, 1.8 - BASELINE_SHIFT)
+    ax.set_xticks([1981, 1990, 2000, 2010, 2020, 2025, 2030])
+    ax.set_xticklabels([1981, 1990, 2000, 2010, 2020, 2025, 2030], rotation=35, ha="right")
+    ax.set_ylabel("Annual mean GMST anomaly (°C)\n(Base period 1961–1990)")
+    secax = ax.secondary_yaxis(
+        "right", functions=(lambda value: value + BASELINE_SHIFT,
+                            lambda value: value - BASELINE_SHIFT),
+    )
+    secax.set_ylabel("(Base period 1850–1900)\nAnnual mean GMST anomaly (°C)", color=RED)
+    secax.tick_params(colors=RED)
+    secax.spines["right"].set_color(RED)
+    ax._right_axis = secax
+
+    bubble_y = [(2022.8, 1.855 - BASELINE_SHIFT, float(frame.loc[2024, "CMST2_GMST"]) + BASELINE_SHIFT,
+                 POST_ORANGE, "2024"),
+                (2028.1, 2.065 - BASELINE_SHIFT, f2027 + BASELINE_SHIFT, RED, "2027")]
+    bubbles = []
+    for x, y, value, color, year in bubble_y:
+        text = ax.text(x, y, f"{value:.3f}°C", color=color, fontsize=13.0,
+                       fontweight="bold", ha="center", va="center", clip_on=False,
+                       bbox=dict(boxstyle="circle,pad=0.60", fc=mpl.colors.to_rgba(color, 0.13),
+                                 ec=mpl.colors.to_rgba(color, 0.38)), zorder=12)
+        ax.annotate(year, (x, y), xytext=(0, 32), textcoords="offset points",
+                    ha="center", va="bottom", color=color, fontsize=12.5,
+                    fontweight="bold", clip_on=False)
+        bubbles.append(text)
+    start = (2024.45, bubble_y[0][1] - 0.018)
+    end = (2026.45, bubble_y[1][1] - 0.018)
+    path = MarkerPath([start, ((start[0] + end[0]) / 2, start[1] - 0.10), end],
+                      [MarkerPath.MOVETO, MarkerPath.CURVE3, MarkerPath.CURVE3])
+    arrow = FancyArrowPatch(path=path, transform=ax.transData, arrowstyle="-|>",
+                            color=RED, linewidth=2.2, mutation_scale=14,
+                            clip_on=False, zorder=11)
+    ax.add_patch(arrow)
+    ax._bubble_2027 = bubbles[1]
+    handles = [
+        Patch(color=LIGHT_ORANGE, label="El Niño-year"),
+        Patch(color=POST_ORANGE, label="Post-El Niño"),
+        Patch(color="#4A84BD", label="Volcanic eruption"),
+        Line2D([], [], color="black", marker="o", ms=3.8, lw=2, label="Observed GMST"),
+        Line2D([], [], marker="*", ls="", ms=13, color="#3575D3", label="2026 Forecast"),
+        Line2D([], [], marker="*", ls="", ms=13, color=RED, label="2027 Forecast"),
+    ]
+    legend = ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.16),
+                       ncol=6, frameon=False, fontsize=11.7, columnspacing=1.3)
+    for text, color in zip(legend.get_texts()[-2:], ("#3575D3", RED)):
+        text.set_color(color)
+        text.set_fontweight("bold")
 
 
-def figure_gmst(input_dir: Path, prepared: Path, output: Path) -> None:
-    validation = pd.read_csv(input_dir / "gmst_cmst2_validation.csv")
-    model = read_json(input_dir / "gmst_cmst2_model.json")
-    series = gmst_series(prepared, validation)
-    fig = plt.figure(figsize=(14.8, 10.5))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1.05, 1.58], hspace=0.34, wspace=0.22,
-                          left=0.07, right=0.985, top=0.95, bottom=0.09)
-    axes = [fig.add_subplot(gs[i, j]) for i in range(2) for j in range(2)]
-    draw_gmst_scatter(axes[0], validation, model["summary"])
-    draw_gmst_time_series(axes[1], series, model)
-    draw_gmst_probability(axes[2], validation, model)
-    draw_gmst_contributions(axes[3], model)
-    for ax, label in zip(axes, "abcd"):
-        panel_label(fig, ax, label, dy=0.022)
-    save_figure(fig, output / "figure_GMST_four_panel_abcd")
+def panel_f(ax: plt.Axes, validation: pd.DataFrame, model: dict) -> None:
+    residual = validation.error.to_numpy(float)
+    forecast = float(model["summary"]["forecast_2027_GMST"])
+    threshold = float(model["summary"]["record_threshold"])
+    possible = forecast - residual
+    gaussian_panel(
+        ax, possible, threshold,
+        f"All historical years: GMST residuals (n = {len(residual)})",
+        "Possible 2027 GMST (°C)", float(model["summary"]["record_probability"]),
+    )
+    ticks = ax.get_xticks()
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{tick + BASELINE_SHIFT:.1f}" for tick in ticks])
 
 
-def supplementary_diagnostics(input_dir: Path, output: Path) -> None:
-    validation = pd.read_csv(input_dir / "enso_ersstv6_validation.csv")
-    seasonal_path = PROJECT_ROOT / "数据" / "diagnostics" / "ersstv6_2002_2009_WWB_D20_SSH_seasonal_standardized.csv"
-    seasonal = pd.read_csv(seasonal_path)
-    fig = plt.figure(figsize=(13.6, 8.7))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1.12, 0.95], hspace=0.55, wspace=0.24,
-                          left=0.07, right=0.985, top=0.95, bottom=0.09)
-    ax = fig.add_subplot(gs[0, :])
-    years = validation.heldout_event.astype(int).to_numpy(); err = validation.error.to_numpy(float)
-    ax.axhspan(-0.5, 0.5, color="#ECFDF5", alpha=0.8)
-    ax.axhline(0, color=BLACK, lw=1.0)
-    colors = [RED if y in STRONG_YEARS else "#FDBA74" for y in years]
-    ax.bar(np.arange(len(years)), err, color=colors, edgecolor="none", width=0.68)
-    ax.set_xticks(np.arange(len(years))); ax.set_xticklabels(years, rotation=45, ha="right")
-    ax.set_ylabel("Error (°C)"); ax.set_xlabel("El Niño event year")
-    axes = [ax]
-    seasons = ["MAM", "JJA", "SON", "DJF"]
-    styles = {"Other El Niño mean": (BLACK, "o"), "2002": (ORANGE, "s"), "2009": ("#C91424", "D")}
-    for j, variable in enumerate(("WWB", "D20", "SSH")):
-        subax = fig.add_subplot(gs[1, j]); axes.append(subax)
-        for case, (color, marker) in styles.items():
-            sub = seasonal[(seasonal.variable == variable) & (seasonal.case == case)]
-            values = [sub.loc[sub.season.eq(s), "standardized_value"].iloc[0] for s in seasons]
-            subax.plot(seasons, values, color=color, marker=marker, lw=1.8, ms=4.6, label=case)
-        subax.axhline(0, color="#7A7A7A", lw=0.8)
-        subax.set_ylabel("Standardized value")
-        subax.text(0.03, 0.92, variable, transform=subax.transAxes, fontweight="bold")
-    axes[1].legend(loc="upper left", bbox_to_anchor=(1.25, 1.30), ncol=3,
-                   frameon=True, facecolor="white", edgecolor="#D8DEE8")
-    for subax, label in zip(axes, "abcd"):
-        panel_label(fig, subax, label, dy=0.022)
-    save_figure(fig, output / "supplement_ENSO_error_2002_2009_diagnostics")
-
-
-def supplementary_sensitivity(input_dir: Path, output: Path) -> None:
-    summary = pd.read_csv(input_dir / "enso_sensitivity_summary.csv")
-    all_validation = pd.read_csv(input_dir / "enso_all_validation.csv")
-    colors = {"ersstv6": BLACK, "ersstv5": "#8A8D00", "cobe2": RED, "hadisst": CYAN}
-    labels = {"ersstv6": "ERSSTv6", "ersstv5": "ERSSTv5", "cobe2": "COBE2", "hadisst": "HadISST"}
-    fig, axes = plt.subplots(2, 1, figsize=(10.0, 10.6), gridspec_kw={"hspace": 0.47})
-    ax = axes[0]
-    years = EVENT_YEARS.tolist() + [2026]; xpos = {year: i for i, year in enumerate(years)}
-    for name in labels:
-        sub = all_validation[all_validation.dataset.eq(name)].sort_values("heldout_event")
-        x = [xpos[int(y)] for y in sub.heldout_event]
-        ax.plot(x, sub.prediction, color=colors[name], marker="o", ms=4, lw=1.9, label=f"{labels[name]} hindcast")
-        f = summary.loc[summary.dataset.eq(name), "forecast_2026_D0JF"].iloc[0]
-        ax.plot([xpos[2023], xpos[2026]], [sub.loc[sub.heldout_event.eq(2023), "prediction"].iloc[0], f],
-                color=colors[name], ls="--", lw=1.9)
-        ax.scatter(xpos[2026], f, marker="*", s=90, color=colors[name], zorder=6)
-    ax.axhline(1.5, color="#F39C34", ls=(0, (5, 4)), lw=1.1)
-    ax.set_xticks(range(len(years))); ax.set_xticklabels(years, rotation=45, ha="right")
-    ax.set_ylabel("Niño3.4 D(0)JF index (°C)"); ax.set_xlabel("El Niño event year")
-    ax.legend(ncol=2, loc="upper left", frameon=True, facecolor="white", edgecolor="#D8DEE8")
-
-    gmst_summary_path = PROJECT_ROOT / "数据" / "global_temp_predictors" / "models" / "gmst_dataset_sensitivity" / "gmst_dataset_sensitivity_summary.csv"
-    gmst_loyo_path = PROJECT_ROOT / "数据" / "global_temp_predictors" / "models" / "gmst_dataset_sensitivity" / "gmst_dataset_sensitivity_loyo_predictions.csv"
-    ax = axes[1]
-    if gmst_summary_path.exists() and gmst_loyo_path.exists():
-        gsumm = pd.read_csv(gmst_summary_path).set_index("dataset")
-        gval = pd.read_csv(gmst_loyo_path)
-        palette = plt.cm.tab10(np.linspace(0, 0.8, len(gsumm)))
-        for color, name in zip(palette, gsumm.index):
-            sub = gval[gval.dataset.eq(name)].sort_values("year")
-            if "hindcast_gmst" not in sub:
-                continue
-            ax.plot(sub.year, sub.hindcast_gmst, color=color, lw=1.6, alpha=0.82, label=name.replace("_main", ""))
-            row = gsumm.loc[name]
-            ax.plot([2025, 2026, 2027], [sub.loc[sub.year.eq(2025), "hindcast_gmst"].iloc[0],
-                                         row.forecast_2026_GMST, row.forecast_2027_GMST],
-                    color=color, ls="--", lw=1.6)
-            ax.scatter([2026, 2027], [row.forecast_2026_GMST, row.forecast_2027_GMST], color=color, s=25)
-        ax.legend(ncol=3, loc="upper left", frameon=True, facecolor="white", edgecolor="#D8DEE8")
-    ax.set_ylabel("Annual mean GMST anomaly (°C)"); ax.set_xlabel("Year")
-    fig.subplots_adjust(left=0.105, right=0.985, top=0.93, bottom=0.07)
-    panel_label(fig, axes[0], "a", dy=0.028); panel_label(fig, axes[1], "b", dy=0.028)
-    save_figure(fig, output / "supplementary_figure2_sensitivity_timeseries")
+def save_figure(fig: plt.Figure, base: Path, extra=()) -> None:
+    for suffix in ("png", "pdf", "svg"):
+        fig.savefig(
+            base.with_suffix(f".{suffix}"),
+            dpi=450 if suffix == "png" else None,
+            bbox_inches="tight", bbox_extra_artists=list(extra), facecolor="white",
+        )
 
 
 def main() -> None:
-    args = parse_args(); setup_style(); args.output.mkdir(parents=True, exist_ok=True)
-    figure_enso(args.input, args.output)
-    figure_gmst(args.input, args.prepared, args.output)
-    supplementary_diagnostics(args.input, args.output)
-    supplementary_sensitivity(args.input, args.output)
+    args = parse_args()
+    setup_style()
+    args.output.mkdir(parents=True, exist_ok=True)
+    all_year = pd.read_csv(args.input / "enso_ersstv6_all_year_validation.csv")
+    events = pd.read_csv(args.input / "enso_ersstv6_validation.csv")
+    enso_model = read_json(args.input / "enso_ersstv6_model.json")
+    gmst_validation = pd.read_csv(args.input / "gmst_cmst2_validation.csv")
+    gmst_model = read_json(args.input / "gmst_cmst2_model.json")
+    series, gmst_frame = gmst_series(args.prepared, gmst_validation)
+
+    fig = plt.figure(figsize=(22.2, 27.0), facecolor="white")
+    outer = fig.add_gridspec(
+        4, 1, height_ratios=[0.68, 0.92, 0.92, 0.98],
+        left=0.075, right=0.895, top=0.945, bottom=0.105, hspace=0.30,
+    )
+    ax_a = fig.add_subplot(outer[0])
+    row_b = outer[1].subgridspec(1, 2, width_ratios=[1.58, 0.62], wspace=0.20)
+    group_b = row_b[0].subgridspec(1, 2, width_ratios=[1.22, 0.22], wspace=0.033)
+    ax_b, key_b = fig.add_subplot(group_b[0]), fig.add_subplot(group_b[1])
+    ax_c = fig.add_subplot(row_b[1])
+    row_d = outer[2].subgridspec(1, 2, width_ratios=[1.58, 0.62], wspace=0.20)
+    group_d = row_d[0].subgridspec(1, 2, width_ratios=[1.22, 0.22], wspace=0.033)
+    ax_d, key_d = fig.add_subplot(group_d[0]), fig.add_subplot(group_d[1])
+    ax_f = fig.add_subplot(row_d[1])
+    ax_e = fig.add_subplot(outer[3])
+
+    forecast = float(enso_model["summary"]["forecast_2026_D0JF"])
+    panel_a(ax_a, all_year, forecast)
+    panel_b(ax_b, key_b, all_year, events, series)
+    panel_c(ax_c, all_year, forecast, float(enso_model["summary"]["historical_record"]))
+    panel_d(ax_d, key_d, series, gmst_model["summary"])
+    panel_f(ax_f, gmst_validation, gmst_model)
+    panel_e(ax_e, series, gmst_frame, gmst_model)
+
+    for ax in (ax_a, ax_b, ax_c, ax_d, ax_f, ax_e):
+        ax.tick_params(width=1.0, length=3.7)
+        ax.xaxis.label.set_fontweight("bold")
+        ax.yaxis.label.set_fontweight("bold")
+    fig.canvas.draw()
+    for probability_ax in (ax_c, ax_f):
+        pos = probability_ax.get_position()
+        probability_ax.set_position([pos.x1 - pos.width * 0.84,
+                                     pos.y0 + pos.height * 0.25,
+                                     pos.width * 0.84, pos.height * 0.64])
+    epos = ax_e.get_position()
+    ax_e.set_position([ax_a.get_position().x0, epos.y0 - 0.01,
+                       ax_a.get_position().width, epos.height * 0.91])
+
+    for ax, label in ((ax_a, "a"), (ax_b, "b"), (ax_c, "c"),
+                      (ax_d, "d"), (ax_f, "f"), (ax_e, "e")):
+        panel_label(fig, ax, label)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    c_start = tuple(fig.transFigure.inverted().transform(ax_c.transData.transform((4.0, 10.0))))
+    a_end = tuple(fig.transFigure.inverted().transform(ax_a.transData.transform((2026.0, 0.0))))
+    a_path = MarkerPath(
+        [c_start, (min(0.99, ax_c.get_position().x1 + 0.075), c_start[1] + 0.035),
+         (min(0.99, ax_a.get_position().x1 + 0.070), a_end[1] - 0.020), a_end],
+        [MarkerPath.MOVETO, MarkerPath.CURVE4, MarkerPath.CURVE4, MarkerPath.CURVE4],
+    )
+    arrow_c = FancyArrowPatch(path=a_path, transform=fig.transFigure, arrowstyle="-|>",
+                              mutation_scale=18, linewidth=3.2, color="#3575D3",
+                              clip_on=False, zorder=40)
+    fig.add_artist(arrow_c)
+    f_end = tuple(fig.transFigure.inverted().transform(ax_f.transData.transform((1.86 - BASELINE_SHIFT, 7.5))))
+    e_box = ax_e._bubble_2027.get_bbox_patch().get_window_extent(renderer).transformed(fig.transFigure.inverted())
+    e_start = (e_box.x1 + 0.002, e_box.y0 + 0.55 * e_box.height)
+    f_path = MarkerPath(
+        [e_start, (min(0.99, e_start[0] + 0.055), e_start[1] + 0.07),
+         (min(0.99, ax_f.get_position().x1 + 0.05), f_end[1] + 0.05), f_end],
+        [MarkerPath.MOVETO, MarkerPath.CURVE4, MarkerPath.CURVE4, MarkerPath.CURVE4],
+    )
+    arrow_f = FancyArrowPatch(path=f_path, transform=fig.transFigure, arrowstyle="-|>",
+                              mutation_scale=18, linewidth=3.2, color="#3575D3",
+                              clip_on=False, zorder=40)
+    fig.add_artist(arrow_f)
+
+    extra = [*fig.texts, ax_a._forecast_bubble, ax_a._forecast_record,
+             ax_e._bubble_2027, arrow_c, arrow_f]
+    base = args.output / "combined_ENSO_GMST_six_panel"
+    save_figure(fig, base, extra)
+    plt.close(fig)
+
+    fig_f, standalone = plt.subplots(figsize=(6.2, 4.8))
+    panel_f(standalone, gmst_validation, gmst_model)
+    fig_f.subplots_adjust(left=0.16, right=0.97, bottom=0.17, top=0.86)
+    save_figure(fig_f, args.output / "GMST_probability_panel_f")
+    plt.close(fig_f)
     print(f"Figures written to {args.output}")
 
 
