@@ -20,9 +20,9 @@ from scipy import stats
 
 
 PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
-DEFAULT_INPUT = PROJECT_ROOT / "数据" / "code_reproduction" / "models"
-DEFAULT_PREPARED = PROJECT_ROOT / "数据" / "code_reproduction" / "prepared"
-DEFAULT_OUTPUT = PROJECT_ROOT / "图件" / "code_reproduction"
+DEFAULT_INPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "models"
+DEFAULT_PREPARED = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "prepared"
+DEFAULT_OUTPUT = PROJECT_ROOT / "图件" / "code_reproduction_1991_2020"
 
 EVENT_YEARS = np.array([
     1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004,
@@ -38,8 +38,6 @@ RED = "#FF0000"
 GRAY = "#D1D5DB"
 PEACOCK = "#2F779F"
 FORECAST_SHADE = "#FCE8E8"
-BASELINE_SHIFT = 0.321
-
 CHECK_MARKER = MarkerPath(
     [(-0.72, -0.02), (-0.22, -0.55), (0.76, 0.62)],
     [MarkerPath.MOVETO, MarkerPath.LINETO, MarkerPath.LINETO],
@@ -111,7 +109,7 @@ def metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
 
 def metric_box(ax: plt.Axes, result: dict[str, float], loc=(0.04, 0.95)) -> None:
     text = (
-        f"r = {result['r']:.3f}\n{sci_p(result['p'])}\n"
+        f"R = {result['r']:.3f}\n{sci_p(result['p'])}\n"
         f"MAE = {result['MAE']:.3f}°C\nRMSE = {result['RMSE']:.3f}°C"
     )
     ax.text(
@@ -139,11 +137,14 @@ def event_styles(event_validation: pd.DataFrame) -> dict[int, tuple[float, str]]
     return styles
 
 
-def gmst_series(prepared: Path, validation: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def gmst_series(
+    prepared: Path, validation: pd.DataFrame, model: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     frame = pd.read_csv(prepared / "gmst_annual_model_frame.csv").set_index("year")
     result = validation.set_index("year").copy()
-    result["observed_gmst"] = frame.loc[result.index, "CMST2_GMST"]
-    result["hindcast_gmst"] = frame.loc[result.index, "GMST_LAG1"] + result.prediction
+    reporting_offset = float(model["summary"].get("reporting_offset_degC", 0.0))
+    result["observed_gmst"] = frame.loc[result.index, "CMST2_GMST"] + reporting_offset
+    result["hindcast_gmst"] = frame.loc[result.index, "GMST_LAG1"] + result.prediction + reporting_offset
     return result.reset_index(), frame
 
 
@@ -193,7 +194,7 @@ def panel_a(ax: plt.Axes, all_year: pd.DataFrame, forecast: float) -> None:
     result = metrics(all_year.observed.to_numpy(float), all_year.prediction.to_numpy(float))
     header = (
         "Leave-one-event-out validation      "
-        f"r = {result['r']:.3f}      {sci_p(result['p'])}      "
+        f"R = {result['r']:.3f}      {sci_p(result['p'])}      "
         f"MAE = {result['MAE']:.3f}°C      RMSE = {result['RMSE']:.3f}°C"
     )
     ax.text(0.015, 1.06, header, transform=ax.transAxes, ha="left", va="bottom",
@@ -296,7 +297,7 @@ def panel_b(
                     fontsize=11.5, color=color, fontweight="bold")
 
 
-def gaussian_panel(
+def empirical_panel(
     ax: plt.Axes, possible: np.ndarray, threshold: float,
     title: str, xlabel: str, probability: float, bar_fraction: float = 0.78,
 ) -> None:
@@ -304,10 +305,15 @@ def gaussian_panel(
     width = edges[1] - edges[0]
     ax.bar(0.5 * (edges[:-1] + edges[1:]), counts, width=width * bar_fraction,
            color=PEACOCK, edgecolor="none", alpha=0.93, zorder=2)
-    mu, sd = float(possible.mean()), float(possible.std(ddof=1))
     grid = np.linspace(min(possible) - width, max(possible) + width, 500)
-    curve = np.exp(-0.5 * ((grid - mu) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
-    curve = curve / curve.max() * (max(counts) + 0.8)
+    # The black curve is a Gaussian-kernel density estimate of the empirical
+    # Monte Carlo sample; no parametric normality assumption is made.
+    if len(np.unique(possible)) > 1:
+        density = stats.gaussian_kde(possible)(grid)
+        curve = density / density.max() * (max(counts) + 0.8)
+    else:
+        curve = np.zeros_like(grid)
+        curve[np.argmin(np.abs(grid - possible[0]))] = max(counts) + 0.8
     ax.plot(grid, curve, color=BLACK, lw=1.8, zorder=4)
     rng = np.random.default_rng(2027)
     ax.scatter(possible, -0.20 + rng.uniform(-0.025, 0.025, len(possible)),
@@ -324,23 +330,19 @@ def gaussian_panel(
     ax.set_ylim(-0.45, max(counts) + 2.0)
 
 
-def panel_c(ax: plt.Axes, all_year: pd.DataFrame, forecast: float, record: float) -> None:
-    residual = np.abs(all_year.prediction.to_numpy(float)) - np.abs(all_year.observed.to_numpy(float))
-    possible = forecast - residual
-    mu, sd = float(residual.mean()), float(residual.std(ddof=1))
-    probability = float(stats.norm.cdf((forecast - record - mu) / sd))
-    gaussian_panel(
+def panel_c(ax: plt.Axes, possible: np.ndarray, forecast: float, record: float,
+            probability: float, strong_probability: float) -> None:
+    empirical_panel(
         ax, possible, record,
-        f"All historical years: |Niño3.4| residuals (n = {len(residual)})",
+        f"15 El Niño-year error resampling (n = {len(EVENT_YEARS)})",
         "Possible 2026/2027 Niño3.4 (°C)", probability, bar_fraction=0.55,
     )
-    strong_p = float(stats.norm.cdf((forecast - 1.5 - mu) / sd))
-    ax.axvline(1.5, color=RED, lw=1.45, ls=(0, (5, 4)))
-    ax.text(1.5 - 0.04, 0.93, f"Strong P:\n{strong_p * 100:.1f}%",
+    ax.axvline(2.0, color=RED, lw=1.45, ls=(0, (5, 4)))
+    ax.text(2.0 - 0.04, 0.93, f"Super-strong P:\n{strong_probability * 100:.1f}%",
             transform=ax.get_xaxis_transform(), ha="right", va="top",
             fontsize=13.0, color=RED, fontweight="bold")
     ymax = ax.get_ylim()[1]
-    ax.text(1.5, ymax * 0.27, "1.5°C", color=RED, rotation=90,
+    ax.text(2.0, ymax * 0.27, "2.0°C", color=RED, rotation=90,
             ha="left", va="center", fontsize=10.5, fontweight="bold")
     ax.text(record, ymax * 0.27, "Record", color=RED, rotation=90,
             ha="left", va="center", fontsize=10.5, fontweight="bold")
@@ -434,18 +436,18 @@ def panel_e(
             lw=2.0, label="Observed GMST", zorder=5)
     f2026 = float(summary["forecast_2026_GMST"])
     f2027 = float(summary["forecast_2027_GMST"])
-    ax.plot([2025, 2026, 2027], [float(frame.loc[2025, "CMST2_GMST"]), f2026, f2027],
+    ax.plot([2025, 2026, 2027], [float(series.loc[series.year.eq(2025), "observed_gmst"].iloc[0]), f2026, f2027],
             color=RED, lw=1.8, ls="--", zorder=6)
     ax.scatter([2026], [f2026], marker="*", s=330, color="#3575D3",
                edgecolors="white", linewidths=0.7, zorder=8)
     ax.scatter([2027], [f2027], marker="*", s=330, color=RED,
                edgecolors="white", linewidths=0.7, zorder=8)
-    ax.axvspan(2025.5, 2030, ymin=0, ymax=(1.70 - BASELINE_SHIFT) / (1.8 - BASELINE_SHIFT),
+    ax.axvspan(2025.5, 2030, ymin=0, ymax=1.70 / 1.8,
                color="#F5E7DB", zorder=0)
-    threshold_native = 1.5 - BASELINE_SHIFT
-    ax.plot([2005, 2030], [threshold_native, threshold_native], color=RED,
+    threshold = 1.5
+    ax.plot([2005, 2030], [threshold, threshold], color=RED,
             lw=2.1, ls=(0, (5, 4)), zorder=4)
-    ax.text(2005.3, threshold_native + 0.025, "1.5°C threshold", color=RED,
+    ax.text(2005.3, threshold + 0.025, "1.5°C threshold", color=RED,
             fontsize=12.3, fontweight="bold")
     records = post_elnino_records(series, f2027)
     for (year0, value0), (year1, value1) in zip(records[:-1], records[1:]):
@@ -463,22 +465,14 @@ def panel_e(
                 ha="center", va="bottom", color=POST_ORANGE,
                 fontsize=9.4, fontweight="bold")
     ax.set_xlim(1980.3, 2030)
-    ax.set_ylim(0, 1.8 - BASELINE_SHIFT)
+    ax.set_ylim(0, 1.8)
     ax.set_xticks([1981, 1990, 2000, 2010, 2020, 2025, 2030])
     ax.set_xticklabels([1981, 1990, 2000, 2010, 2020, 2025, 2030], rotation=35, ha="right")
-    ax.set_ylabel("Annual mean GMST anomaly (°C)\n(Base period 1961–1990)")
-    secax = ax.secondary_yaxis(
-        "right", functions=(lambda value: value + BASELINE_SHIFT,
-                            lambda value: value - BASELINE_SHIFT),
-    )
-    secax.set_ylabel("(Base period 1850–1900)\nAnnual mean GMST anomaly (°C)", color=RED)
-    secax.tick_params(colors=RED)
-    secax.spines["right"].set_color(RED)
-    ax._right_axis = secax
+    ax.set_ylabel("Annual mean GMST anomaly (°C)\n(Base period 1850–1900)")
 
-    bubble_y = [(2022.8, 1.855 - BASELINE_SHIFT, float(frame.loc[2024, "CMST2_GMST"]) + BASELINE_SHIFT,
+    bubble_y = [(2022.8, 1.855, float(frame.loc[2024, "CMST2_GMST"]) + float(summary.get("reporting_offset_degC", 0.0)),
                  POST_ORANGE, "2024"),
-                (2028.1, 2.065 - BASELINE_SHIFT, f2027 + BASELINE_SHIFT, RED, "2027")]
+                (2028.1, 2.065, f2027, RED, "2027")]
     bubbles = []
     for x, y, value, color, year in bubble_y:
         text = ax.text(x, y, f"{value:.3f}°C", color=color, fontsize=13.0,
@@ -513,19 +507,17 @@ def panel_e(
         text.set_fontweight("bold")
 
 
-def panel_f(ax: plt.Axes, validation: pd.DataFrame, model: dict) -> None:
-    residual = validation.error.to_numpy(float)
+def panel_f(ax: plt.Axes, possible: np.ndarray, model: dict) -> None:
     forecast = float(model["summary"]["forecast_2027_GMST"])
     threshold = float(model["summary"]["record_threshold"])
-    possible = forecast - residual
-    gaussian_panel(
+    empirical_panel(
         ax, possible, threshold,
-        f"All historical years: GMST residuals (n = {len(residual)})",
+        "Joint upstream-error Monte Carlo (n = 200,000)",
         "Possible 2027 GMST (°C)", float(model["summary"]["record_probability"]),
     )
     ticks = ax.get_xticks()
     ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{tick + BASELINE_SHIFT:.1f}" for tick in ticks])
+    ax.set_xticklabels([f"{tick:.1f}" for tick in ticks])
 
 
 def save_figure(fig: plt.Figure, base: Path, extra=()) -> None:
@@ -537,6 +529,40 @@ def save_figure(fig: plt.Figure, base: Path, extra=()) -> None:
         )
 
 
+def make_convergence_figure(output: Path, enso_samples: np.ndarray,
+                            gmst_samples: np.ndarray, enso_record: float,
+                            gmst_record: float) -> None:
+    """Plot the 50-seed stability check used for Supplementary Fig. S5."""
+    draws = np.array([100, 300, 1000, 3000, 10000, 30000, 100000, 200000])
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.0), sharey=True)
+    for ax, samples, threshold, title in zip(
+        axes, (enso_samples, gmst_samples), (enso_record, gmst_record),
+        ("ENSO record probability", "2027 GMST record probability"),
+    ):
+        rng_master = np.random.default_rng(20260922)
+        curves = []
+        for _ in range(50):
+            rng = np.random.default_rng(int(rng_master.integers(0, 2**32 - 1)))
+            idx = rng.integers(0, len(samples), size=int(draws[-1]))
+            sampled = samples[idx]
+            curves.append([np.mean(sampled[:n] > threshold) for n in draws])
+        curves = np.asarray(curves)
+        primary_rng = np.random.default_rng(20260922)
+        primary = primary_rng.integers(0, len(samples), size=int(draws[-1]))
+        primary_curve = np.array([np.mean(samples[primary[:n]] > threshold) for n in draws])
+        ax.fill_between(draws, np.quantile(curves, .1, axis=0),
+                        np.quantile(curves, .9, axis=0), color="#F6B36D", alpha=.30)
+        ax.plot(draws, primary_curve, color=ORANGE, lw=1.8)
+        ax.set_xscale("log"); ax.set_ylim(0, 1.02)
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_xlabel("Cumulative Monte Carlo draws")
+        ax.set_ylabel("Record probability")
+        ax.grid(axis="y", alpha=.18)
+    fig.tight_layout()
+    save_figure(fig, output / "Figure_S5_MC_convergence")
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     setup_style()
@@ -546,7 +572,11 @@ def main() -> None:
     enso_model = read_json(args.input / "enso_ersstv6_model.json")
     gmst_validation = pd.read_csv(args.input / "gmst_cmst2_validation.csv")
     gmst_model = read_json(args.input / "gmst_cmst2_model.json")
-    series, gmst_frame = gmst_series(args.prepared, gmst_validation)
+    samples_path = args.input / "monte_carlo_samples.npz"
+    if not samples_path.exists():
+        raise FileNotFoundError("Run 02_fit_validate_models.py first to create empirical MC samples.")
+    mc = np.load(samples_path)
+    series, gmst_frame = gmst_series(args.prepared, gmst_validation, gmst_model)
 
     fig = plt.figure(figsize=(22.2, 27.0), facecolor="white")
     outer = fig.add_gridspec(
@@ -567,9 +597,14 @@ def main() -> None:
     forecast = float(enso_model["summary"]["forecast_2026_D0JF"])
     panel_a(ax_a, all_year, forecast)
     panel_b(ax_b, key_b, all_year, events, series)
-    panel_c(ax_c, all_year, forecast, float(enso_model["summary"]["historical_record"]))
+    panel_c(
+        ax_c, mc["enso_2026"], forecast,
+        float(enso_model["summary"]["historical_record"]),
+        float(enso_model["summary"]["record_probability"]),
+        float(enso_model["summary"]["strong_probability"]),
+    )
     panel_d(ax_d, key_d, series, gmst_model["summary"])
-    panel_f(ax_f, gmst_validation, gmst_model)
+    panel_f(ax_f, mc["gmst_2027"], gmst_model)
     panel_e(ax_e, series, gmst_frame, gmst_model)
 
     for ax in (ax_a, ax_b, ax_c, ax_d, ax_f, ax_e):
@@ -602,7 +637,7 @@ def main() -> None:
                               mutation_scale=18, linewidth=3.2, color="#3575D3",
                               clip_on=False, zorder=40)
     fig.add_artist(arrow_c)
-    f_end = tuple(fig.transFigure.inverted().transform(ax_f.transData.transform((1.86 - BASELINE_SHIFT, 7.5))))
+    f_end = tuple(fig.transFigure.inverted().transform(ax_f.transData.transform((1.86, 7.5))))
     e_box = ax_e._bubble_2027.get_bbox_patch().get_window_extent(renderer).transformed(fig.transFigure.inverted())
     e_start = (e_box.x1 + 0.002, e_box.y0 + 0.55 * e_box.height)
     f_path = MarkerPath(
@@ -622,10 +657,15 @@ def main() -> None:
     plt.close(fig)
 
     fig_f, standalone = plt.subplots(figsize=(6.2, 4.8))
-    panel_f(standalone, gmst_validation, gmst_model)
+    panel_f(standalone, mc["gmst_2027"], gmst_model)
     fig_f.subplots_adjust(left=0.16, right=0.97, bottom=0.17, top=0.86)
     save_figure(fig_f, args.output / "GMST_probability_panel_f")
     plt.close(fig_f)
+    make_convergence_figure(
+        args.output, mc["enso_2026"], mc["gmst_2027"],
+        float(enso_model["summary"]["historical_record"]),
+        float(gmst_model["summary"]["record_threshold"]),
+    )
     print(f"Figures written to {args.output}")
 
 

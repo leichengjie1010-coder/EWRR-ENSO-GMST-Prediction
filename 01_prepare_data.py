@@ -21,7 +21,8 @@ import xarray as xr
 
 DATA_ROOT = Path(os.environ.get("CODEX_DATA_ROOT", os.environ.get("DATA_ROOT", "/Users/leichengjie/Desktop/datas")))
 PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
-DEFAULT_OUTPUT = PROJECT_ROOT / "数据" / "code_reproduction" / "prepared"
+# The current manuscript uses the 1991–2020 computational baseline.
+DEFAULT_OUTPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "prepared"
 YEARS = np.arange(1982, 2027)
 CLIMATOLOGY = (1991, 2020)
 
@@ -32,7 +33,10 @@ SST_FILES = {
     "hadisst": DATA_ROOT / "sst" / "hadisst_monthly_sst_1981_2026_60S70N.nc",
 }
 BASE_FRAME = PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026.csv"
-GMST_FRAME = PROJECT_ROOT / "数据" / "global_temp_predictors" / "models" / "physical_enhanced" / "physical_enhanced_model_frame.csv"
+GMST_FRAME = Path(os.environ.get(
+    "GMST_FRAME",
+    str(PROJECT_ROOT / "数据" / "global_temp_predictors" / "models" / "physical_enhanced_1991_2020" / "physical_enhanced_model_frame.csv"),
+))
 CURATED_FRAMES = {
     "ersstv6": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_ersstv6.csv",
     "ersstv5": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_ersstv5.csv",
@@ -163,7 +167,7 @@ def sst_scalar_indices(sst: xr.DataArray) -> tuple[pd.DataFrame, xr.DataArray, f
 
 def pmm_index(sst: xr.DataArray, nino34: xr.DataArray, atmosphere: Path) -> pd.Series:
     sst_field = subset(sst, -21, 32, 175, 265)
-    with xr.open_dataset(atmosphere, chunks={"time": 12}) as ds:
+    with xr.open_dataset(atmosphere, engine="netcdf4", chunks={"time": 12}) as ds:
         u = subset(find_variable(ds[["u10"]], ("u10",)), -21, 32, 175, 265).interp(lat=sst_field.lat, lon=sst_field.lon)
         v = subset(find_variable(ds[["v10"]], ("v10",)), -21, 32, 175, 265).interp(lat=sst_field.lat, lon=sst_field.lon)
         xs = monthly_anomaly(sst_field).where(sst_field.time.dt.month.isin((3, 4, 5)), drop=True)
@@ -244,7 +248,7 @@ def cold_memory(target: pd.Series, previous_1981: float) -> pd.Series:
 
 def build_sst_frame(name: str, path: Path, base: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     logging.info("Processing %s", name)
-    with xr.open_dataset(path, chunks={"time": 12}) as ds:
+    with xr.open_dataset(path, engine="netcdf4", chunks={"time": 12}) as ds:
         sst = find_variable(ds, ("sst", "sea_surface_temperature", "tos"))
         if pd.Timestamp(sst.time.values[-1]) < pd.Timestamp("2026-05-01"):
             raise ValueError(f"{name} does not reach May 2026: {sst.time.values[-1]}")
@@ -277,8 +281,28 @@ def prepare_gmst_frame(output: Path) -> None:
         raise KeyError(f"GMST model frame is missing {missing}")
     frame[required].to_csv(output / "gmst_annual_model_frame.csv", index=False, float_format="%.9g")
 
+    native_source = Path(os.environ.get(
+        "CMST_SOURCE",
+        str(PROJECT_ROOT / "数据" / "global_temp_predictors" / "processed" / "cmst2_china_mst_imax_annual_parsed.csv"),
+    ))
+    native = pd.read_csv(native_source).set_index("year").sort_index()
+    reporting_offset = float(
+        native.loc[1990:2020, "CMST2_GMST"].mean()
+        - native.loc[1850:1900, "CMST2_GMST"].mean()
+    )
+    return {
+        "computational_baseline": "1991-2020",
+        "reporting_baseline": "1850-1900",
+        "reporting_offset_degC": reporting_offset,
+        "gmst_frame": str(GMST_FRAME),
+        "forecast_method": "fixed point forecasts; empirical Monte Carlo used only for intervals and exceedance probabilities",
+        "enso_error_pool": "15 completed El Nino target winters",
+        "gmst_2027_uncertainty": "six independently resampled upstream-error pools plus GMST increment residual",
+        "monte_carlo_draws": 200000,
+    }
 
-def validate_sources(data_root: Path) -> dict[str, Path]:
+
+def validate_sources(data_root: Path, require_sst: bool = False) -> dict[str, Path]:
     index = data_root / "DATA_INDEX.csv"
     if not index.exists():
         raise FileNotFoundError(f"Canonical data index not found: {index}")
@@ -286,8 +310,14 @@ def validate_sources(data_root: Path) -> dict[str, Path]:
         name: data_root / "sst" / path.name
         for name, path in SST_FILES.items()
     }
-    paths.update({"annual_precursors": BASE_FRAME, "gmst_frame": GMST_FRAME, **CURATED_FRAMES})
-    absent = [str(path) for path in paths.values() if not path.exists()]
+    paths.update({"annual_precursors": BASE_FRAME, "gmst_frame": GMST_FRAME})
+    paths.update({f"curated_{name}": path for name, path in CURATED_FRAMES.items()})
+    # The current reproducibility run uses the archived, analysis-ready
+    # predictor tables. NetCDF SST files are required only when the optional
+    # --recompute-sst path is requested; this avoids failing on a stale alias
+    # for an SST version that is not needed by the default workflow.
+    candidates = paths.values() if require_sst else [paths["annual_precursors"], paths["gmst_frame"], *CURATED_FRAMES.values()]
+    absent = [str(path) for path in candidates if not path.exists()]
     if absent:
         raise FileNotFoundError("Missing canonical input files:\n" + "\n".join(absent))
     return paths
@@ -296,7 +326,7 @@ def validate_sources(data_root: Path) -> dict[str, Path]:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-    sources = validate_sources(args.data_root)
+    sources = validate_sources(args.data_root, require_sst=args.recompute_sst)
     args.output.mkdir(parents=True, exist_ok=True)
     base = pd.read_csv(BASE_FRAME).set_index("year").sort_index()
     metadata = {}
@@ -319,7 +349,8 @@ def main() -> None:
             }
         frame.to_csv(destination, float_format="%.9g")
         metadata[name] = info
-    prepare_gmst_frame(args.output)
+    gmst_metadata = prepare_gmst_frame(args.output)
+    metadata["_global"] = gmst_metadata
     (args.output / "processing_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
