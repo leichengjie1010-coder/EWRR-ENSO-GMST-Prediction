@@ -1,34 +1,47 @@
 #!/usr/bin/env python3
-"""Fit, validate and forecast the ENSO and GMST models used in the paper.
+"""Fit the current nested-CV ENSO--GMST model.
 
-The ENSO experiment predicts the year-to-year change in D(0)JF Nino3.4 with
-event-weighted ridge regression. Hyperparameters are selected inside each
-leave-one-event-out fold. The GMST experiment uses the retained five-factor
-event-weighted regression. The script writes machine-readable predictions,
-summaries and fitted coefficients.
+The implementation follows the current manuscript configuration:
 
+* 44 training years (1982--2025) for both targets;
+* ENSO origin years are weighted for the Niño3.4 model;
+* El Niño decay years (origin year + 1) are weighted for the GMST model;
+* event-weight candidates are 1.00--5.95 in steps of 0.05;
+* ridge candidates are 0 plus 99 logarithmically spaced values from 0.001 to 1;
+* the fixed selection score is
+  0.3(1-r_all) + 0.3(1-r_event) +
+  0.2 RMSE_all/SD_all + 0.2 RMSE_event/SD_event;
+* every target year selects its own weight and penalty inside nested CV;
+* after minimizing the composite score, a selected candidate with CI >= 15
+  keeps its weight and is moved upward along the fixed lambda grid until CI < 15;
+* point forecasts are deterministic; Monte Carlo is used only for intervals
+  and exceedance probabilities.
+
+All input and output locations are supplied through arguments. No machine-
+specific path is embedded in this file.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
-import math
 import os
+import platform
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
-PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
-DEFAULT_INPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "prepared"
-DEFAULT_OUTPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "models"
-DEFAULT_JOINT_ERRORS = PROJECT_ROOT / "结果" / "nmme_current_six_june_skill_20260912" / "selected_joint_upstream_errors.csv"
-MC_DRAWS = 200_000
-MC_SEED = 20260922
-
+TRAIN_YEARS = np.arange(1982, 2026)
+ENSO_EVENT_YEARS = np.array(
+    [1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004,
+     2006, 2009, 2014, 2015, 2018, 2019, 2023], dtype=int,
+)
+GMST_DECAY_YEARS = ENSO_EVENT_YEARS + 1
 ENSO_FEATURES = [
     "WWB_INT", "SSH_RECHARGE_MAM", "PMM_MAM", "IOBM_MAM", "PDO_MAM",
     "NINO34_MAM", "SSH_TREND_MAM", "WWB_INT_MAY", "NINO12_TREND_MAM",
@@ -39,424 +52,791 @@ GMST_FEATURES = [
     "GMST_LAG1", "NINO34_DJF_ENDING_YEAR", "IPO_TPI_LAG1",
     "GLOBAL_SST_ERSSTv6_LAG1", "ERF_WMGHG_LAG1",
 ]
-ENSO_TRAIN_YEARS = np.arange(1982, 2026)
-ENSO_EVENT_YEARS = np.array([1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004, 2006, 2009, 2014, 2015, 2018, 2019, 2023])
-# Text S7: 19 equally spaced candidate case-weight multipliers from 1 to 10.
-RIDGE_WEIGHTS = tuple(np.linspace(1.0, 10.0, 19))
-RIDGE_LAMBDAS = np.r_[0.0, np.geomspace(1e-3, 1e2, 18)]
-GMST_WEIGHTS = RIDGE_WEIGHTS
-GMST_RIDGE_LAMBDAS = RIDGE_LAMBDAS.copy()
+
+# 100 equally spaced values: 1.00, 1.05, ..., 5.95.
+EVENT_WEIGHTS = np.round(1.0 + 0.05 * np.arange(100), 2)
+# 100 values including zero: zero plus 99 logarithmically spaced positives.
+RIDGE_LAMBDAS = np.r_[0.0, np.geomspace(0.001, 1.0, 99)]
+GRID = np.array([(weight, penalty) for penalty in RIDGE_LAMBDAS for weight in EVENT_WEIGHTS])
+SCORE_WEIGHTS = np.array([0.3, 0.3, 0.2, 0.2])
+CONDITION_INDEX_LIMIT = 15.0
+CONDITION_PENALTY_SCALE = 1.0e6
+MC_DRAWS = 200_000
+MC_SEED = 20260917
+STALE_FORECAST_INPUTS_2027 = {
+    "IPO_TPI_LAG1": -0.388260782,
+    "GLOBAL_SST_ERSSTv6_LAG1": 0.446584880,
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--joint-errors", type=Path, default=DEFAULT_JOINT_ERRORS,
-                        help="Six-component historical upstream-error table for 2027 GMST.")
+    parser.add_argument("--input", type=Path, required=True,
+                        help="Directory written by 01_prepare_data.py.")
+    parser.add_argument("--output", type=Path, default=Path("models"))
+    parser.add_argument("--joint-errors", type=Path, default=None,
+                        help="Upstream-error table for TPI and global SST.")
+    parser.add_argument("--erf-errors", type=Path, default=None,
+                        help="Optional ERF residual table with an 'error' column.")
+    parser.add_argument(
+        "--enso-datasets", nargs="+",
+        choices=("ersstv6", "ersstv5", "cobe2", "hadisst"),
+        default=("ersstv6", "ersstv5", "cobe2", "hadisst"),
+        help="ENSO SST datasets to evaluate; ERSSTv6 remains the GMST input.",
+    )
+    parser.add_argument(
+        "--condition-index-limit", type=float, default=15.0,
+        help="Upper bound for the regularized condition index (default: 15).",
+    )
+    parser.add_argument(
+        "--disable-condition-index", action="store_true",
+        help="Disable the condition-index feasibility rule for the unconditioned comparison run.",
+    )
+    parser.add_argument(
+        "--gmst-forecast-inputs", type=Path, default=None,
+        help=("Optional JSON containing annual_hybrid_tpi and "
+              "annual_hybrid_global for the 2027 GMST forecast."),
+    )
+    parser.add_argument(
+        "--gmst-sensitivity-manifest", type=Path, default=None,
+        help=("Optional JSON mapping GMST dataset names to BADC-style annual "
+              "CSV files. Use null for CMST2.0_main. Products are written "
+              "below <output>/gmst_sensitivity."),
+    )
     return parser.parse_args()
 
 
-def standardize(x: np.ndarray, mean: np.ndarray | None = None, std: np.ndarray | None = None):
-    if mean is None:
-        mean = x.mean(axis=0)
-    if std is None:
-        std = x.std(axis=0, ddof=1)
-        std = np.where(std > 1e-12, std, 1.0)
-    return (x - mean) / std, mean, std
+def metric_components(observed: np.ndarray, predicted: np.ndarray,
+                      event_mask: np.ndarray) -> np.ndarray:
+    """Return [1-r_all, 1-r_event, normalized-RMSE-all, normalized-RMSE-event]."""
+    if predicted.ndim == 1:
+        predicted = predicted[:, None]
+    parts = []
+    for mask in (np.ones(len(observed), dtype=bool), event_mask):
+        if mask.sum() < 3:
+            raise ValueError("At least three observations are required for scoring.")
+        obs = observed[mask]
+        pred = predicted[mask]
+        sd = obs.std(ddof=1)
+        obs0 = obs - obs.mean()
+        pred0 = pred - pred.mean(axis=0)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            denom = np.sqrt(np.sum(obs0**2) * np.sum(pred0**2, axis=0))
+            corr = np.divide(
+                obs0 @ pred0, denom,
+                out=np.full(pred.shape[1], -1.0), where=denom > 1e-14,
+            )
+            rmse = np.sqrt(np.mean((pred - obs[:, None]) ** 2, axis=0)) / sd
+        parts.append((1.0 - np.clip(corr, -1.0, 1.0), rmse))
+    return np.column_stack([parts[0][0], parts[1][0], parts[0][1], parts[1][1]])
 
 
-def fit_weighted_linear(
-    x: np.ndarray,
-    y: np.ndarray,
-    weights: np.ndarray,
-    ridge_lambda: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    z, mean, std = standardize(x)
-    design = np.column_stack([np.ones(len(y)), z])
-    if ridge_lambda > 0:
-        penalty = np.diag(np.r_[0.0, np.repeat(ridge_lambda, z.shape[1])])
-        coef = np.linalg.solve(
-            (design.T * weights) @ design / weights.sum() + penalty,
-            (design.T * weights) @ y / weights.sum(),
-        )
-    else:
-        root = np.sqrt(weights)
-        coef = np.linalg.lstsq(design * root[:, None], y * root, rcond=None)[0]
-    return coef, mean, std
+def summary_metrics(observed: np.ndarray, predicted: np.ndarray,
+                    event_mask: np.ndarray) -> dict[str, float]:
+    def one(mask: np.ndarray, label: str) -> dict[str, float]:
+        obs, pred = observed[mask], predicted[mask]
+        error = pred - obs
+        return {
+            f"{label}_n": int(mask.sum()),
+            f"{label}_r": float(np.corrcoef(obs, pred)[0, 1]),
+            f"{label}_RMSE": float(np.sqrt(np.mean(error**2))),
+            f"{label}_MAE": float(np.mean(np.abs(error))),
+        }
 
-
-def apply_model(fit: tuple[np.ndarray, np.ndarray, np.ndarray], x: np.ndarray) -> float:
-    coef, mean, std = fit
-    return float(coef[0] + ((np.asarray(x, float) - mean) / std) @ coef[1:])
-
-
-def metric_summary(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
-    error = predicted - observed
     return {
-        "MAE": float(np.mean(np.abs(error))),
-        "RMSE": float(np.sqrt(np.mean(error**2))),
-        "bias": float(np.mean(error)),
-        "correlation": float(np.corrcoef(observed, predicted)[0, 1]),
+        **one(np.ones(len(observed), dtype=bool), "all"),
+        **one(event_mask, "event"),
     }
-
-
-def student_t_pvalue(r: float, n: int) -> float:
-    try:
-        from scipy.stats import t
-        statistic = abs(r) * math.sqrt((n - 2) / max(1e-15, 1 - r**2))
-        return float(2 * t.sf(statistic, df=n - 2))
-    except ImportError:
-        return float("nan")
-
-
-def empirical_samples(forecast: float, errors: np.ndarray, draws: int = MC_DRAWS,
-                      seed: int = MC_SEED) -> np.ndarray:
-    """Draw empirical Monte Carlo realizations using error = hindcast - observation."""
-    errors = np.asarray(errors, dtype=float)
-    if errors.size == 0 or not np.isfinite(errors).all():
-        raise ValueError("The historical error pool must contain finite values.")
-    rng = np.random.default_rng(seed)
-    return float(forecast) - rng.choice(errors, size=int(draws), replace=True)
-
-
-def empirical_probability(samples: np.ndarray, threshold: float) -> float:
-    return float(np.mean(np.asarray(samples) > float(threshold)))
 
 
 def empirical_interval(samples: np.ndarray, coverage: float = 0.80) -> tuple[float, float]:
-    alpha = 1.0 - coverage
-    return tuple(map(float, np.quantile(samples, [alpha / 2, 1 - alpha / 2])))
+    alpha = (1.0 - coverage) / 2.0
+    return tuple(np.quantile(samples, [alpha, 1.0 - alpha]).astype(float))
 
 
-def remove_event_and_successor(years: np.ndarray, held: int) -> np.ndarray:
-    return years[(years != held) & (years != held + 1)]
+def empirical_samples(forecast: float, errors: np.ndarray, seed: int) -> np.ndarray:
+    errors = np.asarray(errors, dtype=float)
+    if errors.size == 0 or not np.isfinite(errors).all():
+        raise ValueError("The error pool must contain finite values.")
+    rng = np.random.default_rng(seed)
+    return float(forecast) - rng.choice(errors, size=MC_DRAWS, replace=True)
 
 
-def make_enso_increment_table(frame: pd.DataFrame, previous_1981: float) -> pd.DataFrame:
-    df = frame.copy()
-    previous = df.NINO34_D0JF.shift(1)
-    previous.loc[1982] = previous_1981
-    df["PREVIOUS_NINO34_D0JF"] = previous
-    df["DELTA_NINO34_D0JF"] = df.NINO34_D0JF - previous
-    return df
+class NestedEngine:
+    """Vectorized grid fitting and target-specific nested validation."""
+
+    def __init__(self, name: str, kind: str, frame: pd.DataFrame,
+                 features: list[str], target: str, offset: np.ndarray,
+                 event_years: np.ndarray):
+        self.name = name
+        self.kind = kind
+        self.frame = frame.copy()
+        self.years = frame.index.to_numpy(int)
+        self.features = features
+        self.x = frame[features].to_numpy(float)
+        self.y = frame[target].to_numpy(float)
+        self.offset = np.asarray(offset, dtype=float)
+        self.observed = self.y + self.offset
+        self.event_mask = np.isin(self.years, event_years)
+        if not np.isfinite(self.x).all() or not np.isfinite(self.y).all():
+            raise ValueError(f"{name}: non-finite training inputs or targets.")
+        self._fit_cache: dict[tuple[int, ...], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._component_cache: dict[tuple[int, ...], np.ndarray] = {}
+
+    def drop_target(self, ids: np.ndarray, held: int) -> np.ndarray:
+        keep = ids[ids != held]
+        if self.kind == "enso":
+            keep = keep[self.years[keep] != self.years[held] + 1]
+        return keep
+
+    def fit_grid(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        key = tuple(map(int, ids))
+        if key in self._fit_cache:
+            return self._fit_cache[key]
+        x = self.x[ids]
+        y = self.y[ids]
+        mean = x.mean(axis=0)
+        raw_scale = x.std(axis=0, ddof=1)
+        scale = np.where(raw_scale > 1e-12, raw_scale, 1.0)
+        z = (x - mean) / scale
+        event = self.event_mask[ids]
+        design = np.column_stack([np.ones(len(ids)), z])
+        coefs = np.empty((len(GRID), z.shape[1] + 1), dtype=float)
+        condition_indices = np.empty(len(GRID), dtype=float)
+        for wi, weight in enumerate(EVENT_WEIGHTS):
+            weights = np.where(event, weight, 1.0)
+            root = np.sqrt(weights)
+            wsum = weights.sum()
+            z_mean = (weights[:, None] * z).sum(axis=0) / wsum
+            y_mean = float((weights * y).sum() / wsum)
+            z0 = z - z_mean
+            y0 = y - y_mean
+            covariance = (weights[:, None] * z0).T @ z0 / wsum
+            cross = (weights * y0) @ z0 / wsum
+            eigenvalue, eigenvector = np.linalg.eigh(covariance)
+            positive_eigenvalue = np.maximum(eigenvalue, 0.0)
+            for li, penalty in enumerate(RIDGE_LAMBDAS):
+                grid_index = li * len(EVENT_WEIGHTS) + wi
+                condition_indices[grid_index] = float(np.sqrt(
+                    (positive_eigenvalue.max() + penalty)
+                    / max(positive_eigenvalue.min() + penalty, 1.0e-15)
+                ))
+                if penalty == 0.0:
+                    beta = np.linalg.lstsq(
+                        design * root[:, None], y * root, rcond=None
+                    )[0][1:]
+                else:
+                    beta = eigenvector @ (
+                        (eigenvector.T @ cross) / (eigenvalue + penalty)
+                    )
+                intercept = y_mean - z_mean @ beta
+                coefs[grid_index] = np.r_[intercept, beta]
+        self._fit_cache[key] = (coefs, mean, scale, condition_indices)
+        return self._fit_cache[key]
+
+    def predict_grid(self, train_ids: np.ndarray, test_id: int) -> np.ndarray:
+        coefs, mean, scale, _ = self.fit_grid(train_ids)
+        z = (self.x[test_id] - mean) / scale
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            return np.r_[1.0, z] @ coefs.T + self.offset[test_id]
+
+    def inner_components(self, ids: np.ndarray) -> np.ndarray:
+        key = tuple(map(int, ids))
+        if key in self._component_cache:
+            return self._component_cache[key]
+        predictions = np.vstack([
+            self.predict_grid(self.drop_target(ids, int(test)), int(test))
+            for test in ids
+        ])
+        result = metric_components(self.observed[ids], predictions, self.event_mask[ids])
+        self._component_cache[key] = result
+        return result
+
+    def select_grid(self, ids: np.ndarray) -> tuple[int, np.ndarray]:
+        components = self.inner_components(ids)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            score = components @ SCORE_WEIGHTS
+        # Singular unpenalized candidates can produce non-finite diagnostics
+        # in small inner folds.  They are invalid candidates for J and must
+        # never win the grid search.
+        score = np.where(np.isfinite(score), score, np.inf)
+        _, _, _, condition_indices = self.fit_grid(ids)
+        selected = int(np.argmin(score))
+        if not np.isfinite(CONDITION_INDEX_LIMIT):
+            return selected, components
+
+        # Apply the manuscript rule literally: retain the J-minimizing weight,
+        # then increase lambda along the predefined grid until CI < limit.
+        wi = selected % len(EVENT_WEIGHTS)
+        li = selected // len(EVENT_WEIGHTS)
+        if condition_indices[selected] >= CONDITION_INDEX_LIMIT:
+            for candidate_li in range(li + 1, len(RIDGE_LAMBDAS)):
+                candidate = candidate_li * len(EVENT_WEIGHTS) + wi
+                if condition_indices[candidate] < CONDITION_INDEX_LIMIT:
+                    selected = candidate
+                    break
+            else:
+                # Defensive fallback for an insufficient lambda grid: choose
+                # the smallest-CI candidate at the selected weight.
+                same_weight = np.arange(len(RIDGE_LAMBDAS)) * len(EVENT_WEIGHTS) + wi
+                selected = int(same_weight[np.argmin(condition_indices[same_weight])])
+        return selected, components
+
+    def nested_predictions(self, ids: np.ndarray) -> tuple[np.ndarray, pd.DataFrame]:
+        rows, predictions = [], []
+        for test in ids:
+            train = self.drop_target(ids, int(test))
+            selected, components = self.select_grid(train)
+            prediction = self.predict_grid(train, int(test))[selected]
+            predictions.append(prediction)
+            excluded = sorted(set(ids) - set(train))
+            _, _, _, condition_indices = self.fit_grid(train)
+            selected_condition_index = float(condition_indices[selected])
+            rows.append({
+                "target_year": int(self.years[test]),
+                "outer_training_n": int(len(train)),
+                "outer_excluded_years": ",".join(map(str, self.years[excluded])),
+                "event_weight": float(GRID[selected, 0]),
+                "lambda": float(GRID[selected, 1]),
+                "condition_index": selected_condition_index,
+                "condition_index_feasible": bool(selected_condition_index < CONDITION_INDEX_LIMIT),
+                "inner_score": float(components[selected] @ SCORE_WEIGHTS),
+                "r_all_component": float(components[selected, 0]),
+                "r_event_component": float(components[selected, 1]),
+                "RMSE_all_component": float(components[selected, 2]),
+                "RMSE_event_component": float(components[selected, 3]),
+            })
+        return np.asarray(predictions), pd.DataFrame(rows)
 
 
-def fit_enso(df: pd.DataFrame, years: np.ndarray, weight: float, ridge_lambda: float):
-    x = df.loc[years, ENSO_FEATURES].to_numpy(float)
-    y = df.loc[years, "DELTA_NINO34_D0JF"].to_numpy(float)
-    w = np.where(np.isin(years, ENSO_EVENT_YEARS), weight, 1.0)
-    return fit_weighted_linear(x, y, w, ridge_lambda)
+def load_enso_frame(input_dir: Path, name: str, metadata: dict) -> tuple[pd.DataFrame, float]:
+    frame = pd.read_csv(input_dir / f"enso_predictors_{name}.csv").set_index("year").sort_index()
+    frame = frame.loc[TRAIN_YEARS].copy()
+    previous = frame["NINO34_D0JF"].shift(1)
+    previous.loc[1982] = float(metadata[name]["previous_1981_D0JF"])
+    frame["previous_nino34"] = previous
+    frame["delta_nino34"] = frame["NINO34_D0JF"] - frame["previous_nino34"]
+    return frame, float(metadata[name]["previous_1981_D0JF"])
 
 
-def tune_enso(df: pd.DataFrame, years: np.ndarray) -> tuple[float, float]:
-    events = ENSO_EVENT_YEARS[np.isin(ENSO_EVENT_YEARS, years)]
-    best: tuple[float, float, float] | None = None
-    for weight in RIDGE_WEIGHTS:
-        for ridge_lambda in RIDGE_LAMBDAS:
-            errors = []
-            for held in events:
-                train = remove_event_and_successor(years, int(held))
-                fit = fit_enso(df, train, weight, float(ridge_lambda))
-                delta = apply_model(fit, df.loc[held, ENSO_FEATURES].to_numpy(float))
-                prediction = float(df.loc[held, "PREVIOUS_NINO34_D0JF"] + delta)
-                errors.append(abs(prediction - df.loc[held, "NINO34_D0JF"]))
-            candidate = (float(np.mean(errors)), float(ridge_lambda), float(weight))
-            if best is None or candidate < best:
-                best = candidate
-                selected = (float(weight), float(ridge_lambda))
-    return selected
+def load_gmst_frame(input_dir: Path, enso_frame: pd.DataFrame,
+                    previous_1981: float) -> pd.DataFrame:
+    frame = pd.read_csv(input_dir / "gmst_annual_model_frame.csv").set_index("year").sort_index()
+    frame.loc[1982, "NINO34_DJF_ENDING_YEAR"] = previous_1981
+    for year in range(1983, 2028):
+        if year - 1 in enso_frame.index and year in frame.index:
+            frame.loc[year, "NINO34_DJF_ENDING_YEAR"] = enso_frame.loc[year - 1, "NINO34_D0JF"]
+    train = frame.loc[TRAIN_YEARS, GMST_FEATURES + ["DELTA_CMST2_GMST"]]
+    if train.isna().any().any():
+        raise ValueError("GMST training frame contains missing values after ERSSTv6 Niño3.4 mapping.")
+    return frame
 
 
-def run_enso_dataset(name: str, path: Path, previous_1981: float, output: Path):
-    frame = pd.read_csv(path).set_index("year").sort_index()
-    required = set(ENSO_FEATURES + ["NINO34_D0JF"])
-    missing = sorted(required - set(frame.columns))
-    if missing:
-        raise KeyError(f"{name}: missing predictors {missing}")
-    df = make_enso_increment_table(frame, previous_1981)
-    rows = []
-    for held in ENSO_EVENT_YEARS:
-        outer_train = remove_event_and_successor(ENSO_TRAIN_YEARS, int(held))
-        weight, ridge_lambda = tune_enso(df, outer_train)
-        fit = fit_enso(df, outer_train, weight, ridge_lambda)
-        increment = apply_model(fit, df.loc[held, ENSO_FEATURES].to_numpy(float))
-        prediction = float(df.loc[held, "PREVIOUS_NINO34_D0JF"] + increment)
-        observed = float(df.loc[held, "NINO34_D0JF"])
-        rows.append({
-            "dataset": name, "heldout_event": int(held), "observed": observed,
-            "prediction": prediction, "error": prediction - observed,
-            "event_weight": weight, "lambda": ridge_lambda,
-        })
-    predictions = pd.DataFrame(rows)
-    skill = metric_summary(predictions.observed.to_numpy(), predictions.prediction.to_numpy())
-    skill["p_value"] = student_t_pvalue(skill["correlation"], len(predictions))
-    final_weight, final_lambda = tune_enso(df, ENSO_TRAIN_YEARS)
-    fit = fit_enso(df, ENSO_TRAIN_YEARS, final_weight, final_lambda)
-    coef, mean, std = fit
-    x2026 = df.loc[2026, ENSO_FEATURES].to_numpy(float)
-    z2026 = (x2026 - mean) / std
-    delta2026 = float(coef[0] + z2026 @ coef[1:])
-    forecast = float(df.loc[2026, "PREVIOUS_NINO34_D0JF"] + delta2026)
-    residual = predictions.error.to_numpy(float)
-    observed_events = predictions.observed.to_numpy(float)
-    strong_residual = residual[observed_events >= 1.5]
-    # Final uncertainty and probabilities use the 15 completed El Niño error pool.
-    mc_samples = empirical_samples(forecast, residual)
-    mc_conditional = empirical_samples(forecast, strong_residual, seed=MC_SEED + 1)
-    historical_pi = empirical_interval(mc_samples)
-    conditional_pi = empirical_interval(mc_conditional)
-    historical_record = float(predictions.observed.max())
-    summary = {
-        "dataset": name, **skill, "event_weight": final_weight, "lambda": final_lambda,
-        "forecast_delta_2026": delta2026, "forecast_2026_D0JF": forecast,
-        "historical_record": historical_record,
-        "record_probability": empirical_probability(mc_samples, historical_record),
-        "strong_probability": empirical_probability(mc_samples, 2.0),
-        "PI80_historical_lower": historical_pi[0], "PI80_historical_upper": historical_pi[1],
-        "PI80_conditional_lower": conditional_pi[0], "PI80_conditional_upper": conditional_pi[1],
-    }
-    model = {
-        "features": ENSO_FEATURES, "summary": summary,
-        "intercept_delta": float(coef[0]),
-        "coefficients_standardized": dict(zip(ENSO_FEATURES, map(float, coef[1:]))),
-        "training_mean": dict(zip(ENSO_FEATURES, map(float, mean))),
-        "training_std": dict(zip(ENSO_FEATURES, map(float, std))),
-        "x2026": dict(zip(ENSO_FEATURES, map(float, x2026))),
-        "contribution_2026": dict(zip(ENSO_FEATURES, map(float, coef[1:] * z2026))),
-    }
-    predictions.to_csv(output / f"enso_{name}_validation.csv", index=False, float_format="%.9g")
-    if name == "ersstv6":
-        np.savez_compressed(output / "monte_carlo_samples.npz", enso_2026=mc_samples)
-    (output / f"enso_{name}_model.json").write_text(json.dumps(model, indent=2), encoding="utf-8")
-    return summary, predictions
-
-
-def validate_enso_all_years(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for held in ENSO_TRAIN_YEARS:
-        train = remove_event_and_successor(ENSO_TRAIN_YEARS, int(held))
-        weight, ridge_lambda = tune_enso(df, train)
-        fit = fit_enso(df, train, weight, ridge_lambda)
-        increment = apply_model(fit, df.loc[held, ENSO_FEATURES].to_numpy(float))
-        prediction = float(df.loc[held, "PREVIOUS_NINO34_D0JF"] + increment)
-        observed = float(df.loc[held, "NINO34_D0JF"])
-        rows.append({
-            "year": int(held),
-            "observed": observed,
-            "prediction": prediction,
-            "error": prediction - observed,
-            "is_elnino": bool(observed >= 0.5),
-            "event_weight": weight,
-            "lambda": ridge_lambda,
-            "validation_protocol": "leave_target_and_successor_out",
-        })
-    return pd.DataFrame(rows)
-
-
-def fit_gmst(
-    frame: pd.DataFrame,
-    years: np.ndarray,
-    event_years: np.ndarray,
-    event_weight: float,
-    ridge_lambda: float,
-):
-    x = frame.loc[years, GMST_FEATURES].to_numpy(float)
-    y = frame.loc[years, "DELTA_CMST2_GMST"].to_numpy(float)
-    weights = np.where(np.isin(years, event_years), event_weight, 1.0)
-    return fit_weighted_linear(x, y, weights, ridge_lambda)
-
-
-def warm_jump_event_years(frame: pd.DataFrame, years: np.ndarray) -> tuple[float, np.ndarray]:
-    """Define warm-jump years using only the supplied training split."""
-    threshold = float(frame.loc[years, "DELTA_CMST2_GMST"].quantile(0.75))
-    events = years[frame.loc[years, "DELTA_CMST2_GMST"].to_numpy(float) >= threshold]
-    return threshold, events
-
-
-def tune_gmst(frame: pd.DataFrame, years: np.ndarray) -> tuple[float, float]:
-    best: tuple[float, float, float] | None = None
-    selected: tuple[float, float] | None = None
-    for event_weight in GMST_WEIGHTS:
-        for ridge_lambda in GMST_RIDGE_LAMBDAS:
-            errors = []
-            for held in years:
-                train = years[years != held]
-                # Threshold and warm-jump membership are recalculated in the
-                # inner training split; the held year cannot affect either.
-                _, inner_events = warm_jump_event_years(frame, train)
-                fit = fit_gmst(frame, train, inner_events, event_weight, float(ridge_lambda))
-                prediction = apply_model(
-                    fit, frame.loc[held, GMST_FEATURES].to_numpy(float)
-                )
-                observed = float(frame.loc[held, "DELTA_CMST2_GMST"])
-                errors.append(abs(prediction - observed))
-            candidate = (
-                float(np.mean(errors)),
-                float(ridge_lambda),
-                float(event_weight),
-            )
-            if best is None or candidate < best:
-                best = candidate
-                selected = (float(event_weight), float(ridge_lambda))
-    if selected is None:
-        raise RuntimeError("GMST hyperparameter search returned no candidate")
-    return selected
-
-
-def run_gmst_main(
-    path: Path,
-    enso_forecast: float,
-    output: Path,
-    computational_baseline: str = "1990-2020",
-    reporting_baseline: str = "1850-1900",
-    reporting_offset: float = 0.0,
-    joint_errors_path: Path | None = None,
-):
-    frame = pd.read_csv(path).set_index("year").sort_index()
-    train_years = np.arange(1981, 2026)
-    train_years = np.array([year for year in train_years if np.isfinite(frame.loc[year, GMST_FEATURES + ["DELTA_CMST2_GMST"]].to_numpy(float)).all()])
-    threshold, event_years = warm_jump_event_years(frame, train_years)
-    final_weight, final_lambda = tune_gmst(frame, train_years)
-    rows = []
-    for held in train_years:
-        outer_train = train_years[train_years != held]
-        outer_threshold, outer_events = warm_jump_event_years(frame, outer_train)
-        outer_weight, outer_lambda = tune_gmst(frame, outer_train)
-        fit = fit_gmst(
-            frame,
-            outer_train, outer_events, outer_weight, outer_lambda,
-        )
-        prediction = apply_model(fit, frame.loc[held, GMST_FEATURES].to_numpy(float))
-        observed = float(frame.loc[held, "DELTA_CMST2_GMST"])
-        rows.append({"year": int(held), "prediction": prediction, "observed": observed,
-                     "error": prediction - observed, "event_weight": outer_weight,
-                     "lambda": outer_lambda, "warm_jump_threshold": outer_threshold,
-                     "validation_protocol": "nested_leave_one_year_out"})
-    validation = pd.DataFrame(rows)
-    skill = metric_summary(validation.observed.to_numpy(), validation.prediction.to_numpy())
-    skill["p_value"] = student_t_pvalue(skill["correlation"], len(validation))
-    skill["direction_accuracy"] = float(np.mean(np.sign(validation.prediction) == np.sign(validation.observed)))
-
-    fit = fit_gmst(
-        frame, train_years, event_years, final_weight, final_lambda
+def write_enso_outputs(engine: NestedEngine, nested: np.ndarray, tuning: pd.DataFrame,
+                       full_model_index: int, output: Path, forecast_input: np.ndarray,
+                       previous_forecast: float) -> tuple[dict, np.ndarray]:
+    observed = engine.observed
+    prediction = nested
+    error = prediction - observed
+    validation = pd.DataFrame({
+        "year": engine.years,
+        "observed": observed,
+        "prediction": prediction,
+        "observed_increment": engine.y,
+        "prediction_increment": prediction - engine.offset,
+        "error": error,
+        "abs_error": np.abs(error),
+        "is_elnino": engine.event_mask,
+    }).merge(tuning, left_on="year", right_on="target_year", how="left").drop(columns="target_year")
+    validation.to_csv(output / "enso_ersstv6_all_year_validation.csv", index=False, float_format="%.15g")
+    validation.loc[validation.is_elnino].rename(columns={"year": "heldout_event"}).to_csv(
+        output / "enso_ersstv6_validation.csv", index=False, float_format="%.15g"
     )
-    coef, mean, std = fit
-    delta_2026 = apply_model(fit, frame.loc[2026, GMST_FEATURES].to_numpy(float))
-    gmst_2026_computational = float(frame.loc[2026, "GMST_LAG1"] + delta_2026)
-    forecast_frame = frame.copy()
-    forecast_frame.loc[2027, "GMST_LAG1"] = gmst_2026_computational
-    forecast_frame.loc[2027, "NINO34_DJF_ENDING_YEAR"] = enso_forecast
-    delta_2027 = apply_model(fit, forecast_frame.loc[2027, GMST_FEATURES].to_numpy(float))
-    gmst_2027_computational = gmst_2026_computational + delta_2027
-    gmst_2026 = gmst_2026_computational + reporting_offset
-    gmst_2027 = gmst_2027_computational + reporting_offset
-    residual = validation.error.to_numpy(float)
-    record_computational = float(frame.loc[train_years, "CMST2_GMST"].max())
-    record = record_computational + reporting_offset
-    # 2026 GMST uses its complete 45-year residual pool.
-    mc_2026 = empirical_samples(gmst_2026, residual, seed=MC_SEED + 2)
-
-    # 2027 uses the six independently sampled upstream-error pools. The
-    # optional table is produced by the NMME/hybrid hindcast audit; a clear
-    # fallback is retained for users who run the three scripts alone.
-    joint_samples = None
-    if joint_errors_path is not None and joint_errors_path.exists():
-        errors = pd.read_csv(joint_errors_path)
-        expected = ["e_gmst_step1", "e_gmst_step2", "e_enso", "e_tpi_nmme", "e_gsst_nmme", "e_erf"]
-        if set(expected).issubset(errors.columns):
-            rng = np.random.default_rng(MC_SEED + 3)
-            idx = rng.integers(0, len(errors), size=MC_DRAWS)
-            e = {name: errors[name].to_numpy(float)[idx] for name in expected}
-            x_base = forecast_frame.loc[2027, GMST_FEATURES].to_numpy(float)
-            # Each sampled error is hindcast minus observation and is
-            # therefore subtracted from the forecast input.
-            x_draws = np.repeat(x_base[None, :], MC_DRAWS, axis=0)
-            x_draws[:, 0] = x_base[0] - e["e_gmst_step1"]
-            x_draws[:, 1] = x_base[1] - e["e_enso"]
-            x_draws[:, 2] = x_base[2] - e["e_tpi_nmme"]
-            x_draws[:, 3] = x_base[3] - e["e_gsst_nmme"]
-            x_draws[:, 4] = x_base[4] - e["e_erf"]
-            z_draws = (x_draws - mean) / std
-            delta_draws = coef[0] + z_draws @ coef[1:]
-            gmst2026_draws = gmst_2026_computational - e["e_gmst_step1"]
-            joint_samples = gmst2026_draws + delta_draws - e["e_gmst_step2"] + reporting_offset
-    if joint_samples is None:
-        # Fallback: independently sample the final increment residual only.
-        joint_samples = empirical_samples(gmst_2027, residual, seed=MC_SEED + 3)
-    pi_2027 = empirical_interval(joint_samples)
-    z2027 = (forecast_frame.loc[2027, GMST_FEATURES].to_numpy(float) - mean) / std
+    coefs, mean, scale, condition_indices = engine.fit_grid(np.arange(len(engine.years)))
+    coef = coefs[full_model_index]
+    forecast = previous_forecast + float(
+        coef[0] + ((forecast_input - mean) / scale) @ coef[1:]
+    )
+    event_errors = error[engine.event_mask]
+    samples = empirical_samples(forecast, event_errors, MC_SEED)
+    record = float(observed.max())
+    interval = empirical_interval(samples)
     summary = {
-        **skill, "warm_jump_threshold": threshold, "event_weight": final_weight,
-        "lambda": final_lambda,
-        "computational_baseline": computational_baseline,
-        "reporting_baseline": reporting_baseline,
-        "reporting_offset_degC": reporting_offset,
-        "forecast_2026_delta": delta_2026, "forecast_2026_GMST": gmst_2026,
-        "forecast_2027_delta": delta_2027, "forecast_2027_GMST": gmst_2027,
-        "forecast_2026_GMST_computational": gmst_2026_computational,
-        "forecast_2027_GMST_computational": gmst_2027_computational,
-        "record_threshold_computational": record_computational,
-        "record_threshold": record,
-        "record_probability": empirical_probability(joint_samples, record),
-        "record_probability_2026": empirical_probability(mc_2026, record),
-        "PI80_historical_lower": pi_2027[0], "PI80_historical_upper": pi_2027[1],
-        "PI80_conditional_lower": pi_2027[0], "PI80_conditional_upper": pi_2027[1],
+        "dataset": "ersstv6",
+        **summary_metrics(observed, prediction, engine.event_mask),
+        "event_weight": float(GRID[full_model_index, 0]),
+        "lambda": float(GRID[full_model_index, 1]),
+        "condition_index": float(condition_indices[full_model_index]),
+        "forecast_2026_D0JF": forecast,
+        "historical_record": record,
+        "record_probability": float(np.mean(samples > record)),
+        "strong_probability": float(np.mean(samples > 2.0)),
+        "PI80_lower": float(interval[0]),
+        "PI80_upper": float(interval[1]),
+        "error_pool_n": int(len(event_errors)),
+        "selection_rule": (
+            f"minimize J; if selected CI>={CONDITION_INDEX_LIMIT:g}, increase lambda along the "
+            f"predefined grid at fixed w until CI<{CONDITION_INDEX_LIMIT:g}"
+        ),
     }
     model = {
-        "features": GMST_FEATURES, "summary": summary,
-        "intercept_delta": float(coef[0]),
-        "coefficients_standardized": dict(zip(GMST_FEATURES, map(float, coef[1:]))),
-        "training_mean": dict(zip(GMST_FEATURES, map(float, mean))),
-        "training_std": dict(zip(GMST_FEATURES, map(float, std))),
-        "contribution_2027": dict(zip(GMST_FEATURES, map(float, coef[1:] * z2027))),
+        "features": engine.features,
+        "coefficient": coef.tolist(),
+        "mean": mean.tolist(),
+        "std": scale.tolist(),
+        "summary": summary,
+        "grid": {
+            "event_weights": EVENT_WEIGHTS.tolist(),
+            "ridge_lambdas": RIDGE_LAMBDAS.tolist(),
+            "score_weights": SCORE_WEIGHTS.tolist(),
+        },
     }
-    validation.to_csv(output / "gmst_cmst2_validation.csv", index=False, float_format="%.9g")
-    np.savez_compressed(output / "monte_carlo_samples.npz", enso_2026=np.load(output / "monte_carlo_samples.npz")["enso_2026"] if (output / "monte_carlo_samples.npz").exists() else np.empty(0), gmst_2026=mc_2026, gmst_2027=joint_samples)
-    (output / "gmst_cmst2_model.json").write_text(json.dumps(model, indent=2), encoding="utf-8")
-    return summary, validation
+    (output / "enso_ersstv6_model.json").write_text(
+        json.dumps(model, indent=2), encoding="utf-8"
+    )
+    return summary, samples
+
+
+def load_upstream_pools(path: Path | None, erf_path: Path | None,
+                        gmst_errors: np.ndarray, enso_errors: np.ndarray) -> list[np.ndarray]:
+    if path is None:
+        raise ValueError("--joint-errors is required to reproduce the current six-pool GMST uncertainty calculation.")
+    table = pd.read_csv(path)
+    required = {"e_tpi_nmme", "e_gsst_nmme"}
+    if not required.issubset(table.columns):
+        raise KeyError(f"Joint-error table is missing {sorted(required - set(table.columns))}.")
+    if erf_path is not None:
+        erf = pd.read_csv(erf_path)["error"].to_numpy(float)
+    elif "e_erf" in table.columns:
+        erf = table["e_erf"].to_numpy(float)
+    else:
+        raise KeyError("Provide --erf-errors or an e_erf column in --joint-errors.")
+    return [
+        np.asarray(gmst_errors, float), np.asarray(gmst_errors, float),
+        np.asarray(enso_errors, float),
+        table.e_tpi_nmme.to_numpy(float), table.e_gsst_nmme.to_numpy(float),
+        np.asarray(erf, float),
+    ]
+
+
+def validate_forecast_inputs(forecast_inputs: dict | None) -> dict:
+    """Validate the corrected 2027 hybrid inputs before they reach the model."""
+    if forecast_inputs is None:
+        raise ValueError(
+            "--gmst-forecast-inputs is required for the CI15 result; "
+            "the retired prepared-table placeholders are not accepted."
+        )
+    required = {"annual_hybrid_tpi", "annual_hybrid_global"}
+    missing = required - set(forecast_inputs)
+    if missing:
+        raise KeyError(f"GMST forecast-input JSON is missing {sorted(missing)}.")
+    values = {
+        "annual_hybrid_tpi": float(forecast_inputs["annual_hybrid_tpi"]),
+        "annual_hybrid_global": float(forecast_inputs["annual_hybrid_global"]),
+    }
+    if not all(np.isfinite(value) for value in values.values()):
+        raise ValueError("2027 GMST forecast inputs must be finite.")
+    for key, stale in STALE_FORECAST_INPUTS_2027.items():
+        current = values["annual_hybrid_tpi"] if key == "IPO_TPI_LAG1" else values["annual_hybrid_global"]
+        if np.isclose(current, stale, rtol=0.0, atol=1e-12):
+            raise ValueError(f"Retired 2027 placeholder supplied for {key}: {stale}.")
+    return values
+
+
+def write_gmst_outputs(engine: NestedEngine, nested: np.ndarray, tuning: pd.DataFrame,
+                       full_model_index: int, frame: pd.DataFrame, enso_forecast: float,
+                       reporting_offset: float, output: Path,
+                       pools: list[np.ndarray], enso_samples: np.ndarray,
+                       forecast_inputs: dict | None = None) -> dict:
+    coefs, mean, scale, condition_indices = engine.fit_grid(np.arange(len(engine.years)))
+    coef = coefs[full_model_index]
+    observed_increment = engine.y
+    error = nested - observed_increment
+    validation = pd.DataFrame({
+        "year": engine.years,
+        "observed": observed_increment,
+        "prediction": nested,
+        "observed_increment": observed_increment,
+        "prediction_increment": nested,
+        "error": error,
+        "abs_error": np.abs(error),
+        "is_decay_year": engine.event_mask,
+    }).merge(tuning, left_on="year", right_on="target_year", how="left").drop(columns="target_year")
+    reporting = float(reporting_offset)
+    validation["observed_gmst"] = frame.loc[engine.years, "CMST2_GMST"].to_numpy(float) + reporting
+    validation["hindcast_gmst"] = frame.loc[engine.years, "GMST_LAG1"].to_numpy(float) + nested + reporting
+    validation.to_csv(output / "gmst_cmst2_validation.csv", index=False, float_format="%.15g")
+
+    x2026 = frame.loc[2026, GMST_FEATURES].to_numpy(float).copy()
+    x2026[0] = float(frame.loc[2025, "CMST2_GMST"])
+    delta2026 = float(coef[0] + ((x2026 - mean) / scale) @ coef[1:])
+    raw2026 = x2026[0] + delta2026
+    x2027 = frame.loc[2027, GMST_FEATURES].to_numpy(float).copy()
+    x2027[0] = raw2026
+    x2027[1] = enso_forecast
+    forecast_inputs = validate_forecast_inputs(forecast_inputs)
+    # Use the same 2026 hybrid upstream forecasts used to define the 2027
+    # target, rather than stale placeholder values in the prepared frame.
+    x2027[2] = forecast_inputs["annual_hybrid_tpi"]
+    x2027[3] = forecast_inputs["annual_hybrid_global"]
+    delta2027 = float(coef[0] + ((x2027 - mean) / scale) @ coef[1:])
+    raw2027 = raw2026 + delta2027
+
+    rng = np.random.default_rng(MC_SEED)
+    draws = np.column_stack([rng.choice(pool, MC_DRAWS, replace=True) for pool in pools])
+    beta = coef[1:] / scale
+    sensitivity = np.r_[-(1.0 + beta[0]), -1.0, -beta[1:]]
+    gmst2026_samples = raw2026 + reporting - draws[:, 0]
+    gmst2027_samples = raw2027 + reporting + draws @ sensitivity
+    record = float(frame.loc[TRAIN_YEARS, "CMST2_GMST"].max() + reporting)
+    interval = empirical_interval(gmst2027_samples)
+    summary = {
+        "dataset": "CMST2.0_main",
+        **summary_metrics(observed_increment, nested, engine.event_mask),
+        "event_weight": float(GRID[full_model_index, 0]),
+        "lambda": float(GRID[full_model_index, 1]),
+        "condition_index": float(condition_indices[full_model_index]),
+        "forecast_2026_delta": delta2026,
+        "forecast_2027_delta": delta2027,
+        "forecast_2026_GMST": raw2026 + reporting,
+        "forecast_2027_GMST": raw2027 + reporting,
+        "forecast_2026_GMST_computational": raw2026,
+        "forecast_2027_GMST_computational": raw2027,
+        "record_threshold": record,
+        "record_probability": float(np.mean(gmst2027_samples > record)),
+        "record_probability_2026": float(np.mean(gmst2026_samples > record)),
+        "PI80_lower": float(interval[0]),
+        "PI80_upper": float(interval[1]),
+        "error_pool_n": int(len(engine.years)),
+        "decay_years": GMST_DECAY_YEARS.tolist(),
+        "forecast_inputs_2027": {
+            "GMST_LAG1": float(x2027[0]),
+            "NINO34_DJF_ENDING_YEAR": float(x2027[1]),
+            "IPO_TPI_LAG1": float(x2027[2]),
+            "GLOBAL_SST_ERSSTv6_LAG1": float(x2027[3]),
+            "ERF_WMGHG_LAG1": float(x2027[4]),
+        },
+        "selection_rule": (
+            f"minimize J; if selected CI>={CONDITION_INDEX_LIMIT:g}, increase lambda along the "
+            f"predefined grid at fixed w until CI<{CONDITION_INDEX_LIMIT:g}"
+        ),
+    }
+    model = {
+        "features": engine.features,
+        "coefficient": coef.tolist(),
+        "mean": mean.tolist(),
+        "std": scale.tolist(),
+        "summary": summary,
+        "grid": {
+            "event_weights": EVENT_WEIGHTS.tolist(),
+            "ridge_lambdas": RIDGE_LAMBDAS.tolist(),
+            "score_weights": SCORE_WEIGHTS.tolist(),
+        },
+    }
+    (output / "gmst_cmst2_model.json").write_text(
+        json.dumps(model, indent=2), encoding="utf-8"
+    )
+    np.savez_compressed(
+        output / "monte_carlo_samples.npz",
+        # Keep the ENSO and GMST draws together so the figure script can
+        # reproduce every probability panel from the same model run.
+        enso_2026=enso_samples,
+        gmst_2026=gmst2026_samples, gmst_2027=gmst2027_samples,
+    )
+    return summary
+
+
+def read_badc_series(path: Path) -> pd.Series:
+    """Read the annual ``year,data`` section used by the GMST archives."""
+    lines = path.read_text(errors="replace").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip().lower() == "data")
+    except StopIteration as exc:
+        raise ValueError(f"BADC file has no data section: {path}") from exc
+    table = pd.read_csv(path, skiprows=start + 1)
+    if not {"year", "data"}.issubset(table.columns):
+        raise KeyError(f"BADC file must contain year and data columns: {path}")
+    table["year"] = pd.to_numeric(table["year"], errors="coerce")
+    table["data"] = pd.to_numeric(table["data"], errors="coerce")
+    table = table.dropna(subset=["year", "data"])
+    return pd.Series(table["data"].to_numpy(float), index=table["year"].astype(int)).sort_index()
+
+
+def run_gmst_sensitivity(
+    manifest_path: Path, output: Path, base_frame: pd.DataFrame,
+    metadata: dict, enso_forecast: float, enso_samples: np.ndarray,
+    event_errors: np.ndarray, joint_errors: Path, erf_errors: Path | None,
+    forecast_inputs: dict,
+) -> None:
+    """Fit all GMST datasets listed in a portable, user-supplied manifest."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    datasets = manifest.get("datasets", manifest)
+    if not isinstance(datasets, dict) or not datasets:
+        raise ValueError("GMST sensitivity manifest must map dataset names to files.")
+    destination = output / "gmst_sensitivity"
+    destination.mkdir(parents=True, exist_ok=True)
+    rows, contributions, audits = [], [], []
+    for name, raw_path in datasets.items():
+        frame = base_frame.copy()
+        if raw_path is not None:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = manifest_path.parent / path
+            report = read_badc_series(path)
+            offset = float(report.loc[1991:2020].mean())
+            target = report - offset
+            frame["CMST2_GMST"] = target.reindex(frame.index)
+            frame["GMST_LAG1"] = target.reindex(frame.index - 1).to_numpy()
+            frame["DELTA_CMST2_GMST"] = target.diff().reindex(frame.index)
+        else:
+            offset = float(metadata.get("_global", {}).get("reporting_offset_degC", 0.0))
+        if not np.isfinite(frame.loc[TRAIN_YEARS, GMST_FEATURES + ["DELTA_CMST2_GMST"]]).all().all():
+            raise ValueError(f"GMST sensitivity dataset {name} contains missing training values.")
+        train = frame.loc[TRAIN_YEARS].copy()
+        engine = NestedEngine(name, "gmst", train, GMST_FEATURES,
+                              "DELTA_CMST2_GMST", np.zeros(len(train)), GMST_DECAY_YEARS)
+        ids = np.arange(len(train))
+        predictions, tuning = engine.nested_predictions(ids)
+        selected, _ = engine.select_grid(ids)
+        if not tuning.condition_index_feasible.all():
+            raise ValueError(f"GMST sensitivity dataset {name} violates CI15.")
+        pools = load_upstream_pools(joint_errors, erf_errors,
+                                    predictions - engine.y, event_errors)
+        dataset_output = destination / str(name)
+        dataset_output.mkdir(parents=True, exist_ok=True)
+        tuning.to_csv(dataset_output / "gmst_target_hyperparameters.csv", index=False)
+        summary = write_gmst_outputs(
+            engine, predictions, tuning, selected, frame, enso_forecast,
+            offset, dataset_output, pools, enso_samples, forecast_inputs,
+        )
+        summary["dataset"] = str(name)
+        samples = np.load(dataset_output / "monte_carlo_samples.npz")
+        summary["PI80_2026_lower"], summary["PI80_2026_upper"] = np.quantile(
+            samples["gmst_2026"], [0.1, 0.9]
+        )
+        summary["P_2027_gt_1p5"] = float(np.mean(samples["gmst_2027"] > 1.5))
+        summary["P_2027_gt_2026"] = float(np.mean(samples["gmst_2027"] > samples["gmst_2026"]))
+        model_path = dataset_output / "gmst_cmst2_model.json"
+        model = json.loads(model_path.read_text(encoding="utf-8"))
+        model["summary"] = summary
+        model_path.write_text(json.dumps(model, indent=2), encoding="utf-8")
+        beta = np.asarray(model["coefficient"], dtype=float)
+        mean = np.asarray(model["mean"], dtype=float)
+        scale = np.asarray(model["std"], dtype=float)
+        x2027 = np.array([summary["forecast_inputs_2027"][key] for key in GMST_FEATURES])
+        values = np.r_[beta[0], beta[1:] * (x2027 - mean) / scale]
+        np.testing.assert_allclose(values.sum(), summary["forecast_2027_delta"], atol=1e-12)
+        contributions.extend(
+            {"dataset": str(name), "factor": factor, "contribution": float(value)}
+            for factor, value in zip(["Intercept"] + GMST_FEATURES, values)
+        )
+        audits.append({
+            "dataset": str(name), "n": len(train),
+            "event_n": int(engine.event_mask.sum()),
+            "all_selected_CI_lt_15": True,
+            "max_outer_CI": float(tuning.condition_index.max()),
+            "error_pool_sizes": [len(pool) for pool in pools],
+            "reporting_offset": offset,
+        })
+        rows.append(summary)
+        pd.DataFrame(rows).to_csv(
+            destination / "gmst_dataset_sensitivity_summary.csv",
+            index=False, float_format="%.15g",
+        )
+    pd.DataFrame(contributions).to_csv(
+        destination / "contributions.csv", index=False, float_format="%.15g"
+    )
+    (destination / "audit.json").write_text(
+        json.dumps(audits, indent=2), encoding="utf-8"
+    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def portable_path(path: Path) -> str:
+    """Keep manifests relocatable by recording paths relative to the cwd."""
+    try:
+        return os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return path.name
+
+
+def write_run_manifest(output: Path, input_dir: Path, input_files: list[Path],
+                       config: dict, forecast_inputs: Path | None) -> None:
+    files = [Path(__file__).resolve(), *(Path(path) for path in input_files if path is not None)]
+    hashes = {
+        portable_path(path): sha256_file(path)
+        for path in files if path.exists() and path.is_file()
+    }
+    manifest = {
+        "manifest_version": "1.0",
+        "result_version": "CI15_lambda0-1",
+        "source_code": portable_path(Path(__file__).resolve()),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "input_directory": portable_path(input_dir),
+        "output_directory": portable_path(output),
+        "input_file_hashes": hashes,
+        "forecast_inputs_file": portable_path(forecast_inputs) if forecast_inputs else None,
+        "configuration": config,
+    }
+    (output / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def main() -> None:
     args = parse_args()
+    global CONDITION_INDEX_LIMIT, CONDITION_PENALTY_SCALE
+    if args.disable_condition_index:
+        CONDITION_INDEX_LIMIT = float("inf")
+        CONDITION_PENALTY_SCALE = 0.0
+    else:
+        CONDITION_INDEX_LIMIT = float(args.condition_index_limit)
+        CONDITION_PENALTY_SCALE = 1.0e6
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
     args.output.mkdir(parents=True, exist_ok=True)
     metadata_path = args.input / "processing_metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-    summaries, validations = [], []
-    for name in ("ersstv6", "ersstv5", "cobe2", "hadisst"):
-        path = args.input / f"enso_predictors_{name}.csv"
-        if not path.exists():
-            raise FileNotFoundError(f"Run 01_prepare_data.py first: {path}")
-        previous = float(metadata.get(name, {}).get("previous_1981_D0JF", pd.read_csv(path).NINO34_D0JF.iloc[0]))
-        logging.info("ENSO leave-one-event-out validation: %s", name)
-        summary, validation = run_enso_dataset(name, path, previous, args.output)
-        summaries.append(summary)
-        validations.append(validation)
-        if name == "ersstv6":
-            frame = pd.read_csv(path).set_index("year").sort_index()
-            all_year = validate_enso_all_years(make_enso_increment_table(frame, previous))
-            all_year.to_csv(
-                args.output / "enso_ersstv6_all_year_validation.csv",
-                index=False,
-                float_format="%.9g",
-            )
-    pd.DataFrame(summaries).to_csv(args.output / "enso_sensitivity_summary.csv", index=False, float_format="%.9g")
-    pd.concat(validations, ignore_index=True).to_csv(args.output / "enso_all_validation.csv", index=False, float_format="%.9g")
 
-    main_enso = next(item for item in summaries if item["dataset"] == "ersstv6")
-    gmst_summary, gmst_validation = run_gmst_main(
-        args.input / "gmst_annual_model_frame.csv",
-        main_enso["forecast_2026_D0JF"],
-        args.output,
-        computational_baseline=metadata.get("_global", {}).get("computational_baseline", "1990-2020"),
-        reporting_baseline=metadata.get("_global", {}).get("reporting_baseline", "1850-1900"),
-        reporting_offset=float(metadata.get("_global", {}).get("reporting_offset_degC", 0.0)),
-        joint_errors_path=args.joint_errors,
+    config = {
+        "training_years": [1982, 2025],
+        "n_training_years": 44,
+        "enso_event_years": ENSO_EVENT_YEARS.tolist(),
+        "gmst_decay_years": GMST_DECAY_YEARS.tolist(),
+        "event_weight_grid": EVENT_WEIGHTS.tolist(),
+        "ridge_lambda_grid": RIDGE_LAMBDAS.tolist(),
+        "score_weights": SCORE_WEIGHTS.tolist(),
+        "condition_index_limit": (None if not np.isfinite(CONDITION_INDEX_LIMIT) else CONDITION_INDEX_LIMIT),
+        "condition_index_rule": (
+            "disabled; candidates are ranked by J without a condition-index penalty"
+            if not np.isfinite(CONDITION_INDEX_LIMIT)
+            else f"minimize J; if selected CI >= {CONDITION_INDEX_LIMIT:g}, increase lambda along the predefined grid at fixed w until CI < {CONDITION_INDEX_LIMIT:g}"
+        ),
+        "condition_penalty_scale": (
+            None if np.isfinite(CONDITION_INDEX_LIMIT) else CONDITION_PENALTY_SCALE
+        ),
+        "monte_carlo_draws": MC_DRAWS,
+        "point_forecasts_use_monte_carlo_mean": False,
+    }
+    (args.output / "model_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    all_summaries = []
+    ersstv6_engine = None
+    ersstv6_samples = None
+    for name in args.enso_datasets:
+        frame, previous = load_enso_frame(args.input, name, metadata)
+        engine = NestedEngine(
+            name, "enso", frame, ENSO_FEATURES, "delta_nino34",
+            frame.previous_nino34.to_numpy(float), ENSO_EVENT_YEARS,
+        )
+        nested, tuning = engine.nested_predictions(np.arange(len(frame)))
+        selected, _ = engine.select_grid(np.arange(len(frame)))
+        tuning.to_csv(args.output / f"enso_{name}_target_hyperparameters.csv", index=False)
+        raw_input = pd.read_csv(args.input / f"enso_predictors_{name}.csv").set_index("year")
+        forecast_input = raw_input.loc[2026, ENSO_FEATURES].to_numpy(float)
+        previous_forecast = float(raw_input.loc[2026, "previous_nino34"]) if "previous_nino34" in raw_input else float(raw_input.loc[2025, "NINO34_D0JF"])
+        if name == "ersstv6":
+            summary, samples = write_enso_outputs(
+                engine, nested, tuning, selected, args.output,
+                forecast_input, previous_forecast,
+            )
+            ersstv6_engine, ersstv6_samples = engine, samples
+        else:
+            obs, pred = engine.observed, nested
+            coefs, mean, scale, condition_indices = engine.fit_grid(np.arange(len(engine.years)))
+            coef = coefs[selected]
+            forecast = previous_forecast + float(
+                coef[0] + ((forecast_input - mean) / scale) @ coef[1:]
+            )
+            event_errors = (pred - obs)[engine.event_mask]
+            samples = empirical_samples(forecast, event_errors, MC_SEED)
+            record = float(obs.max())
+            interval = empirical_interval(samples)
+            summary = {
+                "dataset": name, **summary_metrics(obs, pred, engine.event_mask),
+                "event_weight": float(GRID[selected, 0]),
+                "lambda": float(GRID[selected, 1]),
+                "condition_index": float(condition_indices[selected]),
+                "forecast_2026_D0JF": forecast,
+                "historical_record": record,
+                "record_probability": float(np.mean(samples > record)),
+                "strong_probability": float(np.mean(samples > 2.0)),
+                "PI80_lower": float(interval[0]),
+                "PI80_upper": float(interval[1]),
+                "error_pool_n": int(len(event_errors)),
+                "selection_rule": (
+                    f"minimize J; if selected CI>={CONDITION_INDEX_LIMIT:g}, increase lambda along the "
+                    f"predefined grid at fixed w until CI<{CONDITION_INDEX_LIMIT:g}"
+                ),
+            }
+            pd.DataFrame({
+                "year": engine.years, "observed": obs, "prediction": pred,
+                "error": pred - obs, "is_elnino": engine.event_mask,
+            }).to_csv(args.output / f"enso_{name}_validation.csv", index=False, float_format="%.15g")
+            (args.output / f"enso_{name}_model.json").write_text(
+                json.dumps({"features": ENSO_FEATURES, "summary": summary}, indent=2),
+                encoding="utf-8",
+            )
+        all_summaries.append(summary)
+
+    if ersstv6_engine is None or ersstv6_samples is None:
+        raise RuntimeError("ERSSTv6 ENSO model was not produced.")
+    pd.DataFrame(all_summaries).to_csv(
+        args.output / "enso_sensitivity_summary.csv", index=False, float_format="%.15g"
     )
-    pd.DataFrame([gmst_summary]).to_csv(args.output / "gmst_main_summary.csv", index=False, float_format="%.9g")
-    logging.info("ENSO forecast: %.3f degC", main_enso["forecast_2026_D0JF"])
-    logging.info("2027 GMST forecast: %.3f degC", gmst_summary["forecast_2027_GMST"])
+
+    enso_frame, previous = load_enso_frame(args.input, "ersstv6", metadata)
+    gmst_frame = load_gmst_frame(args.input, enso_frame, previous)
+    forecast_inputs = None
+    if args.gmst_forecast_inputs is not None:
+        forecast_inputs = json.loads(args.gmst_forecast_inputs.read_text(encoding="utf-8"))
+    forecast_inputs = validate_forecast_inputs(forecast_inputs)
+    gmst_train = gmst_frame.loc[TRAIN_YEARS].copy()
+    gmst_engine = NestedEngine(
+        "GMST", "gmst", gmst_train, GMST_FEATURES, "DELTA_CMST2_GMST",
+        np.zeros(len(gmst_train)), GMST_DECAY_YEARS,
+    )
+    gmst_nested, gmst_tuning = gmst_engine.nested_predictions(np.arange(len(gmst_train)))
+    gmst_selected, _ = gmst_engine.select_grid(np.arange(len(gmst_train)))
+    gmst_tuning.to_csv(args.output / "gmst_target_hyperparameters.csv", index=False)
+    gmst_errors = gmst_nested - gmst_engine.y
+    enso_validation = pd.read_csv(args.output / "enso_ersstv6_validation.csv")
+    event_errors = enso_validation["error"].to_numpy(float)
+    event_errors = event_errors[np.isin(enso_validation["heldout_event"], ENSO_EVENT_YEARS)]
+    pools = load_upstream_pools(args.joint_errors, args.erf_errors, gmst_errors, event_errors)
+    reporting_offset = float(metadata.get("_global", {}).get("reporting_offset_degC", 0.0))
+    enso_forecast = float(json.loads(
+        (args.output / "enso_ersstv6_model.json").read_text()
+    )["summary"]["forecast_2026_D0JF"])
+    gmst_summary = write_gmst_outputs(
+        gmst_engine, gmst_nested, gmst_tuning, gmst_selected, gmst_frame,
+        enso_forecast, reporting_offset, args.output, pools, ersstv6_samples,
+        forecast_inputs,
+    )
+    pd.DataFrame([gmst_summary]).to_csv(
+        args.output / "gmst_main_summary.csv", index=False, float_format="%.15g"
+    )
+    logging.info("ERSSTv6 ENSO forecast: %.4f°C", enso_forecast)
+    logging.info("2027 GMST forecast: %.4f°C", gmst_summary["forecast_2027_GMST"])
+    if args.gmst_sensitivity_manifest is not None:
+        run_gmst_sensitivity(
+            args.gmst_sensitivity_manifest, args.output, gmst_frame, metadata,
+            enso_forecast, ersstv6_samples, event_errors, args.joint_errors,
+            args.erf_errors, forecast_inputs,
+        )
+    write_run_manifest(
+        args.output, args.input,
+        [metadata_path, args.joint_errors, args.erf_errors, args.gmst_forecast_inputs,
+         args.gmst_sensitivity_manifest, *args.input.glob("*.csv")],
+        config, args.gmst_forecast_inputs,
+    )
     logging.info("Model outputs written to %s", args.output)
 
 

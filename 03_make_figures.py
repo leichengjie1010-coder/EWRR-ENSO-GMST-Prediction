@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
+import sys
 from pathlib import Path
 
 import matplotlib as mpl
@@ -16,13 +19,15 @@ import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, Patch
 from matplotlib.path import Path as MarkerPath
+from matplotlib.ticker import FormatStrFormatter
 from scipy import stats
 
 
-PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
-DEFAULT_INPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "models"
-DEFAULT_PREPARED = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "prepared"
-DEFAULT_OUTPUT = PROJECT_ROOT / "图件" / "code_reproduction_1991_2020"
+# Paths are supplied by arguments or environment variables; no local address
+# is embedded in the figure script.
+DEFAULT_INPUT = Path(os.environ.get("MODEL_OUTPUT", "models"))
+DEFAULT_PREPARED = Path(os.environ.get("PREPARED_OUTPUT", "prepared"))
+DEFAULT_OUTPUT = Path(os.environ.get("FIGURE_OUTPUT", "figures"))
 
 EVENT_YEARS = np.array([
     1982, 1986, 1987, 1991, 1994, 1997, 2002, 2004,
@@ -38,6 +43,10 @@ RED = "#FF0000"
 GRAY = "#D1D5DB"
 PEACOCK = "#2F779F"
 FORECAST_SHADE = "#FCE8E8"
+STALE_FORECAST_INPUTS_2027 = {
+    "IPO_TPI_LAG1": -0.388260782,
+    "GLOBAL_SST_ERSSTv6_LAG1": 0.446584880,
+}
 CHECK_MARKER = MarkerPath(
     [(-0.72, -0.02), (-0.22, -0.55), (0.76, 0.62)],
     [MarkerPath.MOVETO, MarkerPath.LINETO, MarkerPath.LINETO],
@@ -49,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--prepared", type=Path, default=DEFAULT_PREPARED)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--forecast-inputs", type=Path, default=None,
+        help="Optional corrected 2027 forecast-input JSON for the audit manifest.",
+    )
     return parser.parse_args()
 
 
@@ -110,7 +123,7 @@ def metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
 def metric_box(ax: plt.Axes, result: dict[str, float], loc=(0.04, 0.95)) -> None:
     text = (
         f"R = {result['r']:.3f}\n{sci_p(result['p'])}\n"
-        f"MAE = {result['MAE']:.3f}°C\nRMSE = {result['RMSE']:.3f}°C"
+        f"MAE = {result['MAE']:.2f}°C\nRMSE = {result['RMSE']:.2f}°C"
     )
     ax.text(
         *loc, text, transform=ax.transAxes, ha="left", va="top",
@@ -143,8 +156,15 @@ def gmst_series(
     frame = pd.read_csv(prepared / "gmst_annual_model_frame.csv").set_index("year")
     result = validation.set_index("year").copy()
     reporting_offset = float(model["summary"].get("reporting_offset_degC", 0.0))
-    result["observed_gmst"] = frame.loc[result.index, "CMST2_GMST"] + reporting_offset
-    result["hindcast_gmst"] = frame.loc[result.index, "GMST_LAG1"] + result.prediction + reporting_offset
+    # Validation products from the current workflow already contain displayed
+    # GMST levels after the reporting-baseline offset.  Use them directly so
+    # the figure does not fall back to the internal computational scale.
+    if {"observed_gmst", "hindcast_gmst"}.issubset(result.columns):
+        result["observed_gmst"] = result["observed_gmst"].astype(float)
+        result["hindcast_gmst"] = result["hindcast_gmst"].astype(float)
+    else:
+        result["observed_gmst"] = frame.loc[result.index, "CMST2_GMST"] + reporting_offset
+        result["hindcast_gmst"] = frame.loc[result.index, "GMST_LAG1"] + result.prediction + reporting_offset
     return result.reset_index(), frame
 
 
@@ -191,11 +211,12 @@ def panel_a(ax: plt.Axes, all_year: pd.DataFrame, forecast: float) -> None:
     ax.get_xticklabels()[-1].set_color(RED)
     ax.get_xticklabels()[-1].set_fontweight("bold")
     ax.set_ylabel("Niño3.4 D(0)JF (°C)")
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     result = metrics(all_year.observed.to_numpy(float), all_year.prediction.to_numpy(float))
     header = (
         "Leave-one-event-out validation      "
         f"R = {result['r']:.3f}      {sci_p(result['p'])}      "
-        f"MAE = {result['MAE']:.3f}°C      RMSE = {result['RMSE']:.3f}°C"
+        f"MAE = {result['MAE']:.2f}°C      RMSE = {result['RMSE']:.2f}°C"
     )
     ax.text(0.015, 1.06, header, transform=ax.transAxes, ha="left", va="bottom",
             fontsize=14.1, fontweight="bold", clip_on=False)
@@ -213,7 +234,7 @@ def panel_a(ax: plt.Axes, all_year: pd.DataFrame, forecast: float) -> None:
     for text in [*history_legend.get_texts(), *forecast_legend.get_texts()]:
         text.set_fontweight("bold")
     bubble = ax.text(
-        2026, forecast + 0.48, f"{forecast:.3f}°C",
+        2026, forecast + 0.48, f"{forecast:.2f}°C",
         color=RED, fontsize=13.7, fontweight="bold", ha="center", va="center",
         bbox=dict(boxstyle="circle,pad=0.75", fc="#FFE7E7", ec="#FFAAAA"),
         clip_on=False, zorder=15,
@@ -277,6 +298,8 @@ def panel_b(
     ax.set_box_aspect(0.72)
     ax.set_xlabel("Observed Niño3.4 D(0)JF index (°C)")
     ax.set_ylabel("Hindcast Niño3.4 D(0)JF (°C)")
+    ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     metric_box(ax, metrics(events.observed.to_numpy(float), events.prediction.to_numpy(float)))
 
     key_ax.set_axis_off()
@@ -324,6 +347,7 @@ def empirical_panel(
             fontsize=13.0, color=RED, fontweight="bold")
     ax.set_title(title, loc="left", x=0.04, fontsize=13.2, fontweight="bold", pad=10)
     ax.set_xlabel(xlabel, color=RED, fontsize=13.1)
+    ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     ax.set_ylabel("Count")
     ax.tick_params(axis="x", colors=RED)
     ax.spines["bottom"].set_color(BLACK)
@@ -369,13 +393,13 @@ def panel_d(ax: plt.Axes, key_ax: plt.Axes, series: pd.DataFrame, summary: dict)
     ax.plot(grid, grid, color=BLACK, lw=1.3)
     record_years = [year for year, _ in post_elnino_records(series)]
     record_set = set(record_years)
-    warm = set(series.loc[series.observed >= summary["warm_jump_threshold"], "year"].astype(int))
-    other = ~series.year.astype(int).isin(record_set | warm)
+    # The current model defines the displayed event classes only by model-
+    # fitted post-El Niño records.  Warm-jump threshold classification was
+    # removed from the current workflow; all remaining years are "Other".
+    warm = set()
+    other = ~series.year.astype(int).isin(record_set)
     ax.scatter(series.loc[other, "observed"], series.loc[other, "prediction"],
-               s=62, color=PEACOCK, alpha=0.72, edgecolors="none", zorder=2)
-    warm_only = series.year.astype(int).isin(warm - record_set)
-    ax.scatter(series.loc[warm_only, "observed"], series.loc[warm_only, "prediction"],
-               s=92, color=ORANGE, edgecolors="none", zorder=4)
+               s=62, color=ORANGE, alpha=0.82, edgecolors="none", zorder=3)
     styles = gmst_record_styles(series, record_years)
     for year in record_years:
         row = series.loc[series.year.eq(year)].iloc[0]
@@ -394,6 +418,8 @@ def panel_d(ax: plt.Axes, key_ax: plt.Axes, series: pd.DataFrame, summary: dict)
     ax.set_box_aspect(0.72)
     ax.set_xlabel("Observed ΔGMST (°C)")
     ax.set_ylabel("Hindcast ΔGMST (°C)")
+    ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     metric_box(ax, metrics(observed, predicted))
 
     key_ax.set_axis_off()
@@ -407,10 +433,8 @@ def panel_d(ax: plt.Axes, key_ax: plt.Axes, series: pd.DataFrame, summary: dict)
         key_ax.scatter([0.10], [y], s=size * 0.70, color=color, edgecolors="none")
         key_ax.text(0.24, y, str(year), ha="left", va="center",
                     fontsize=11.5, color=color, fontweight="bold")
-    key_ax.text(0.05, 0.27, "Warm jump", fontsize=13.3, fontweight="bold", color=BLACK)
-    key_ax.scatter([0.10], [0.20], s=75, color=ORANGE, edgecolors="none")
-    key_ax.text(0.05, 0.12, "Other", fontsize=13.3, fontweight="bold", color=BLACK)
-    key_ax.scatter([0.10], [0.05], s=62, color=PEACOCK, edgecolors="none")
+    key_ax.text(0.05, 0.18, "Other", fontsize=13.3, fontweight="bold", color=BLACK)
+    key_ax.scatter([0.10], [0.08], s=75, color=ORANGE, edgecolors="none")
 
 
 def panel_e(
@@ -469,13 +493,14 @@ def panel_e(
     ax.set_xticks([1981, 1990, 2000, 2010, 2020, 2025, 2030])
     ax.set_xticklabels([1981, 1990, 2000, 2010, 2020, 2025, 2030], rotation=35, ha="right")
     ax.set_ylabel("Annual mean GMST anomaly (°C)\n(Base period 1850–1900)")
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
 
     bubble_y = [(2022.8, 1.855, float(frame.loc[2024, "CMST2_GMST"]) + float(summary.get("reporting_offset_degC", 0.0)),
                  POST_ORANGE, "2024"),
                 (2028.1, 2.065, f2027, RED, "2027")]
     bubbles = []
     for x, y, value, color, year in bubble_y:
-        text = ax.text(x, y, f"{value:.3f}°C", color=color, fontsize=13.0,
+        text = ax.text(x, y, f"{value:.2f}°C", color=color, fontsize=13.0,
                        fontweight="bold", ha="center", va="center", clip_on=False,
                        bbox=dict(boxstyle="circle,pad=0.60", fc=mpl.colors.to_rgba(color, 0.13),
                                  ec=mpl.colors.to_rgba(color, 0.38)), zorder=12)
@@ -517,7 +542,7 @@ def panel_f(ax: plt.Axes, possible: np.ndarray, model: dict) -> None:
     )
     ticks = ax.get_xticks()
     ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{tick:.1f}" for tick in ticks])
+    ax.set_xticklabels([f"{tick:.2f}" for tick in ticks])
 
 
 def save_figure(fig: plt.Figure, base: Path, extra=()) -> None:
@@ -527,6 +552,104 @@ def save_figure(fig: plt.Figure, base: Path, extra=()) -> None:
             dpi=450 if suffix == "png" else None,
             bbox_inches="tight", bbox_extra_artists=list(extra), facecolor="white",
         )
+
+
+def validate_figure_inputs(input_dir: Path, prepared: Path, gmst_model: dict,
+                           forecast_path: Path | None) -> dict:
+    """Audit the values actually used by the figure panels."""
+    summary_inputs = gmst_model.get("summary", {}).get("forecast_inputs_2027", {})
+    required = {"IPO_TPI_LAG1", "GLOBAL_SST_ERSSTv6_LAG1"}
+    missing = required - set(summary_inputs)
+    if missing:
+        raise KeyError(f"GMST model summary is missing {sorted(missing)}.")
+    for key, stale in STALE_FORECAST_INPUTS_2027.items():
+        if np.isclose(float(summary_inputs[key]), stale, rtol=0.0, atol=1e-12):
+            raise ValueError(f"Figure input audit found retired placeholder in {key}.")
+    if forecast_path is not None:
+        supplied = json.loads(forecast_path.read_text(encoding="utf-8"))
+        for source_key, summary_key in (
+            ("annual_hybrid_tpi", "IPO_TPI_LAG1"),
+            ("annual_hybrid_global", "GLOBAL_SST_ERSSTv6_LAG1"),
+        ):
+            if not np.isclose(float(supplied[source_key]), float(summary_inputs[summary_key]),
+                              rtol=0.0, atol=1e-12):
+                raise ValueError(f"Forecast-input JSON and GMST model disagree for {source_key}.")
+    prepared_values = {}
+    frame_path = prepared / "gmst_annual_model_frame.csv"
+    if frame_path.exists():
+        frame = pd.read_csv(frame_path).set_index("year")
+        if 2027 in frame.index:
+            prepared_values = {
+                key: float(frame.loc[2027, key])
+                for key in STALE_FORECAST_INPUTS_2027 if key in frame.columns
+            }
+    stale_in_prepared = {
+        key: value for key, value in prepared_values.items()
+        if np.isclose(value, STALE_FORECAST_INPUTS_2027[key], rtol=0.0, atol=1e-12)
+    }
+    sensitivity_match = None
+    contributions = input_dir / "gmst_sensitivity" / "contributions.csv"
+    if contributions.exists():
+        table = pd.read_csv(contributions)
+        primary = table.loc[table.dataset.eq("CMST2.0_main"), "contribution"]
+        if not primary.empty:
+            sensitivity_match = bool(np.isclose(
+                primary.sum(), float(gmst_model["summary"]["forecast_2027_delta"]),
+                rtol=0.0, atol=1e-12,
+            ))
+            if not sensitivity_match:
+                raise ValueError("GMST sensitivity contributions do not match the model summary.")
+    return {
+        "forecast_inputs_2027": {
+            "IPO_TPI_LAG1": float(summary_inputs["IPO_TPI_LAG1"]),
+            "GLOBAL_SST_ERSSTv6_LAG1": float(summary_inputs["GLOBAL_SST_ERSSTv6_LAG1"]),
+        },
+        "prepared_frame_2027_values": prepared_values,
+        "prepared_placeholders_detected": stale_in_prepared,
+        "stale_placeholder_values_not_used": True,
+        "sensitivity_contributions_match": sensitivity_match,
+    }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def portable_path(path: Path) -> str:
+    try:
+        return os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return path.name
+
+
+def write_run_manifest(output: Path, input_dir: Path, prepared: Path,
+                       model_files: list[Path], audit: dict) -> None:
+    files = [Path(__file__).resolve(), *model_files]
+    hashes = {
+        portable_path(path): sha256_file(path)
+        for path in files if path.exists() and path.is_file()
+    }
+    manifest = {
+        "manifest_version": "1.0",
+        "result_version": "CI15_figure_pipeline",
+        "source_code": portable_path(Path(__file__).resolve()),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "input_directory": portable_path(input_dir),
+        "prepared_directory": portable_path(prepared),
+        "output_directory": portable_path(output),
+        "input_file_hashes": hashes,
+        "figure_input_audit": audit,
+        "figure_outputs": sorted(path.name for path in output.glob("*.*")
+                                  if path.name != "run_manifest.json"),
+    }
+    (output / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def make_convergence_figure(output: Path, enso_samples: np.ndarray,
@@ -572,6 +695,10 @@ def main() -> None:
     enso_model = read_json(args.input / "enso_ersstv6_model.json")
     gmst_validation = pd.read_csv(args.input / "gmst_cmst2_validation.csv")
     gmst_model = read_json(args.input / "gmst_cmst2_model.json")
+    forecast_path = args.forecast_inputs or (args.input / "forecast_inputs_2027.json")
+    if not forecast_path.exists():
+        forecast_path = None
+    audit = validate_figure_inputs(args.input, args.prepared, gmst_model, forecast_path)
     samples_path = args.input / "monte_carlo_samples.npz"
     if not samples_path.exists():
         raise FileNotFoundError("Run 02_fit_validate_models.py first to create empirical MC samples.")
@@ -665,6 +792,18 @@ def main() -> None:
         args.output, mc["enso_2026"], mc["gmst_2027"],
         float(enso_model["summary"]["historical_record"]),
         float(gmst_model["summary"]["record_threshold"]),
+    )
+    write_run_manifest(
+        args.output, args.input, args.prepared,
+        [args.input / name for name in (
+            "enso_ersstv6_model.json", "enso_ersstv6_all_year_validation.csv",
+            "enso_ersstv6_validation.csv", "gmst_cmst2_model.json",
+            "gmst_cmst2_validation.csv", "monte_carlo_samples.npz",
+            "forecast_inputs_2027.json",
+        )] + [args.prepared / name for name in (
+            "gmst_annual_model_frame.csv", "processing_metadata.json",
+        )],
+        audit,
     )
     print(f"Figures written to {args.output}")
 

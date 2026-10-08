@@ -9,9 +9,12 @@ reported in Methods, and writes compact annual tables for the modelling step.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import platform
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,35 +22,37 @@ import pandas as pd
 import xarray as xr
 
 
-DATA_ROOT = Path(os.environ.get("CODEX_DATA_ROOT", os.environ.get("DATA_ROOT", "/Users/leichengjie/Desktop/datas")))
-PROJECT_ROOT = Path(os.environ.get("ENSO_PROJECT_ROOT", "/Users/leichengjie/Desktop/2026ENSO"))
-# The current manuscript uses the 1991–2020 computational baseline.
-DEFAULT_OUTPUT = PROJECT_ROOT / "数据" / "code_reproduction_1991_2020" / "prepared"
+# Paths are intentionally supplied by the user or the execution environment.
+# No machine-specific data address is embedded in the reproducibility code.
+DEFAULT_DATA_ROOT = os.environ.get("DATA_ROOT") or os.environ.get("CODEX_DATA_ROOT")
+DEFAULT_OUTPUT = Path(os.environ.get("PREPARED_OUTPUT", "prepared"))
 YEARS = np.arange(1982, 2027)
 CLIMATOLOGY = (1991, 2020)
 
-SST_FILES = {
-    "ersstv6": DATA_ROOT / "sst" / "ersstv6_monthly_sst_1981_2026_60S70N.nc",
-    "ersstv5": DATA_ROOT / "sst" / "ersstv5_monthly_sst_1981_2026_60S70N.nc",
-    "cobe2": DATA_ROOT / "sst" / "cobe2_sst_1981_2026_60S70N.nc",
-    "hadisst": DATA_ROOT / "sst" / "hadisst_monthly_sst_1981_2026_60S70N.nc",
+SST_FILENAMES = {
+    "ersstv6": "ersstv6_monthly_sst_1981_2026_60S70N.nc",
+    "ersstv5": "ersstv5_monthly_sst_1981_2026_60S70N.nc",
+    "cobe2": "cobe2_sst_1981_2026_60S70N.nc",
+    "hadisst": "hadisst_monthly_sst_1981_2026_60S70N.nc",
 }
-BASE_FRAME = PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026.csv"
-GMST_FRAME = Path(os.environ.get(
-    "GMST_FRAME",
-    str(PROJECT_ROOT / "数据" / "global_temp_predictors" / "models" / "physical_enhanced_1991_2020" / "physical_enhanced_model_frame.csv"),
-))
-CURATED_FRAMES = {
-    "ersstv6": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_ersstv6.csv",
-    "ersstv5": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_ersstv5.csv",
-    "cobe2": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_cobe2_user_full.csv",
-    "hadisst": PROJECT_ROOT / "数据" / "enso_factors" / "enso_predictors_1982_2026_hadisst.csv",
+CURATED_FILENAMES = {
+    "ersstv6": "enso_predictors_1982_2026_ersstv6.csv",
+    "ersstv5": "enso_predictors_1982_2026_ersstv5.csv",
+    "cobe2": "enso_predictors_1982_2026_cobe2_user_full.csv",
+    "hadisst": "enso_predictors_1982_2026_hadisst.csv",
 }
 PREVIOUS_1981 = {
     "ersstv6": -0.12113380432128906,
     "ersstv5": -0.0798861161,
     "cobe2": -0.28676095604896545,
     "hadisst": -0.05189259722828865,
+}
+# These two values were present in an old prepared table.  They are retained
+# only as a regression guard: a current run must either replace them from the
+# supplied 2027 forecast-input JSON or fail before writing model inputs.
+STALE_FORECAST_INPUTS_2027 = {
+    "IPO_TPI_LAG1": -0.388260782,
+    "GLOBAL_SST_ERSSTv6_LAG1": 0.446584880,
 }
 
 SST_BOXES = {
@@ -64,7 +69,37 @@ SST_BOXES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
+    parser.add_argument(
+        "--data-root", type=Path,
+        default=Path(DEFAULT_DATA_ROOT) if DEFAULT_DATA_ROOT else None,
+        help="Canonical climate-data root; may also be supplied through DATA_ROOT.",
+    )
+    parser.add_argument(
+        "--base-frame", type=Path, required=True,
+        help="Analysis-ready ENSO predictor table used as the base frame.",
+    )
+    parser.add_argument(
+        "--gmst-frame", type=Path, required=True,
+        help="Annual GMST predictor table before the ERSSTv6 Niño3.4 replacement.",
+    )
+    parser.add_argument(
+        "--curated-dir", type=Path, default=None,
+        help="Directory containing the four archived ENSO predictor tables.",
+    )
+    parser.add_argument(
+        "--gmst-source", type=Path, default=None,
+        help="Optional native GMST series used to calculate the reporting-baseline offset.",
+    )
+    parser.add_argument(
+        "--forecast-inputs", type=Path, default=None,
+        help=("JSON with the corrected 2027 annual_hybrid_tpi and "
+              "annual_hybrid_global values; required when the prepared frame "
+              "contains the retired placeholder values."),
+    )
+    parser.add_argument(
+        "--reporting-offset", type=float, default=None,
+        help="Optional audited 1850-1900 reporting-baseline offset in degrees C.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -270,67 +305,171 @@ def build_sst_frame(name: str, path: Path, base: pd.DataFrame) -> tuple[pd.DataF
     return frame, metadata
 
 
-def prepare_gmst_frame(output: Path) -> None:
-    frame = pd.read_csv(GMST_FRAME)
+def prepare_gmst_frame(
+    output: Path, gmst_frame_path: Path, enso_frame: pd.DataFrame,
+    previous_1981: float, gmst_source: Path | None = None,
+    forecast_inputs: dict[str, float] | None = None,
+    reporting_offset_override: float | None = None,
+) -> dict:
+    frame = pd.read_csv(gmst_frame_path).set_index("year").sort_index()
     required = [
-        "year", "GMST_LAG1", "NINO34_DJF_ENDING_YEAR", "IPO_TPI_LAG1",
+        "GMST_LAG1", "NINO34_DJF_ENDING_YEAR", "IPO_TPI_LAG1",
         "GLOBAL_SST_ERSSTv6_LAG1", "ERF_WMGHG_LAG1", "DELTA_CMST2_GMST", "CMST2_GMST",
     ]
     missing = sorted(set(required) - set(frame.columns))
     if missing:
         raise KeyError(f"GMST model frame is missing {missing}")
-    frame[required].to_csv(output / "gmst_annual_model_frame.csv", index=False, float_format="%.9g")
-
-    native_source = Path(os.environ.get(
-        "CMST_SOURCE",
-        str(PROJECT_ROOT / "数据" / "global_temp_predictors" / "processed" / "cmst2_china_mst_imax_annual_parsed.csv"),
-    ))
-    native = pd.read_csv(native_source).set_index("year").sort_index()
-    reporting_offset = float(
-        native.loc[1990:2020, "CMST2_GMST"].mean()
-        - native.loc[1850:1900, "CMST2_GMST"].mean()
+    # The GMST model must use the same ERSSTv6 Niño3.4 series as the ENSO
+    # model.  Year y uses the previous winter's D(0)JF value.
+    nino = enso_frame["NINO34_D0JF"].astype(float)
+    if 1982 in frame.index:
+        frame.loc[1982, "NINO34_DJF_ENDING_YEAR"] = float(previous_1981)
+    for year in range(1983, 2027):
+        if year in frame.index and year - 1 in nino.index:
+            frame.loc[year, "NINO34_DJF_ENDING_YEAR"] = float(nino.loc[year - 1])
+    stale = {
+        key: float(frame.loc[2027, key])
+        for key in STALE_FORECAST_INPUTS_2027
+        if 2027 in frame.index and key in frame.columns
+    }
+    if forecast_inputs is not None:
+        required_inputs = {"annual_hybrid_tpi", "annual_hybrid_global"}
+        missing_inputs = required_inputs - set(forecast_inputs)
+        if missing_inputs:
+            raise KeyError(f"Forecast-input JSON is missing {sorted(missing_inputs)}.")
+        if 2027 not in frame.index:
+            raise KeyError("GMST model frame must contain year 2027 for forecast inputs.")
+        corrected = {
+            "IPO_TPI_LAG1": float(forecast_inputs["annual_hybrid_tpi"]),
+            "GLOBAL_SST_ERSSTv6_LAG1": float(forecast_inputs["annual_hybrid_global"]),
+        }
+        if not all(np.isfinite(value) for value in corrected.values()):
+            raise ValueError("2027 forecast inputs must be finite.")
+        frame.loc[2027, list(corrected)] = list(corrected.values())
+    current = {
+        key: float(frame.loc[2027, key])
+        for key in STALE_FORECAST_INPUTS_2027
+        if 2027 in frame.index and key in frame.columns
+    }
+    for key, old_value in STALE_FORECAST_INPUTS_2027.items():
+        if key in current and np.isclose(current[key], old_value, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                f"Retired 2027 placeholder remains in {key}: {old_value}. "
+                "Pass --forecast-inputs with the corrected hybrid values."
+            )
+    frame[required].reset_index().to_csv(
+        output / "gmst_annual_model_frame.csv", index=False, float_format="%.17g"
     )
+
+    reporting_offset = 0.0
+    if gmst_source is not None:
+        native = pd.read_csv(gmst_source).set_index("year").sort_index()
+        reporting_offset = float(
+            native.loc[1991:2020, "CMST2_GMST"].mean()
+            - native.loc[1850:1900, "CMST2_GMST"].mean()
+        )
+    if reporting_offset_override is not None:
+        if not np.isfinite(reporting_offset_override):
+            raise ValueError("--reporting-offset must be finite.")
+        reporting_offset = float(reporting_offset_override)
     return {
         "computational_baseline": "1991-2020",
         "reporting_baseline": "1850-1900",
         "reporting_offset_degC": reporting_offset,
-        "gmst_frame": str(GMST_FRAME),
-        "forecast_method": "fixed point forecasts; empirical Monte Carlo used only for intervals and exceedance probabilities",
+        "gmst_frame": str(gmst_frame_path),
+        "gmst_training_years": "1982-2025 (44 years)",
+        "nino34_source_for_gmst": "ERSSTv6 D(0)JF series from the prepared ENSO frame",
+        "forecast_method": "deterministic point forecasts; empirical Monte Carlo is used only for intervals and exceedance probabilities",
         "enso_error_pool": "15 completed El Nino target winters",
-        "gmst_2027_uncertainty": "six independently resampled upstream-error pools plus GMST increment residual",
+        "gmst_2027_uncertainty": "six independently resampled upstream-error pools; the ENSO pool contains 15 El Nino winters",
         "monte_carlo_draws": 200000,
+        "forecast_inputs_2027": forecast_inputs,
+        "retired_placeholder_values_seen_before_replacement": stale,
+        "retired_placeholder_values_used": False,
     }
 
 
-def validate_sources(data_root: Path, require_sst: bool = False) -> dict[str, Path]:
+def validate_sources(
+    data_root: Path | None, base_frame: Path, gmst_frame: Path,
+    curated_dir: Path, require_sst: bool = False,
+) -> dict[str, Path]:
+    if data_root is None:
+        raise ValueError("Set DATA_ROOT or pass --data-root before running the preparation step.")
     index = data_root / "DATA_INDEX.csv"
     if not index.exists():
-        raise FileNotFoundError(f"Canonical data index not found: {index}")
-    paths = {
-        name: data_root / "sst" / path.name
-        for name, path in SST_FILES.items()
-    }
-    paths.update({"annual_precursors": BASE_FRAME, "gmst_frame": GMST_FRAME})
-    paths.update({f"curated_{name}": path for name, path in CURATED_FRAMES.items()})
+        index = data_root / "DATA_INDEX.json"
+    if not index.exists():
+        raise FileNotFoundError(f"Canonical data index not found below {data_root}")
+    paths = {name: data_root / "sst" / filename for name, filename in SST_FILENAMES.items()}
+    paths.update({"annual_precursors": base_frame, "gmst_frame": gmst_frame})
+    paths.update({f"curated_{name}": curated_dir / filename for name, filename in CURATED_FILENAMES.items()})
     # The current reproducibility run uses the archived, analysis-ready
     # predictor tables. NetCDF SST files are required only when the optional
     # --recompute-sst path is requested; this avoids failing on a stale alias
     # for an SST version that is not needed by the default workflow.
-    candidates = paths.values() if require_sst else [paths["annual_precursors"], paths["gmst_frame"], *CURATED_FRAMES.values()]
+    if require_sst:
+        candidates = [paths["annual_precursors"], paths["gmst_frame"],
+                      *[paths[name] for name in SST_FILENAMES]]
+    else:
+        candidates = [paths["annual_precursors"], paths["gmst_frame"],
+                      *[paths[f"curated_{name}"] for name in CURATED_FILENAMES]]
     absent = [str(path) for path in candidates if not path.exists()]
     if absent:
         raise FileNotFoundError("Missing canonical input files:\n" + "\n".join(absent))
     return paths
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def portable_path(path: Path) -> str:
+    try:
+        return os.path.relpath(path, Path.cwd())
+    except ValueError:
+        return path.name
+
+
+def write_run_manifest(output: Path, input_files: list[Path | None], config: dict) -> None:
+    files = [Path(__file__).resolve(), *(Path(path) for path in input_files if path is not None)]
+    hashes = {
+        portable_path(path): sha256_file(path)
+        for path in files if path.exists() and path.is_file()
+    }
+    manifest = {
+        "manifest_version": "1.0",
+        "result_version": "CI15_prepared_inputs",
+        "source_code": portable_path(Path(__file__).resolve()),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "output_directory": portable_path(output),
+        "input_file_hashes": hashes,
+        "configuration": config,
+    }
+    (output / "run_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-    sources = validate_sources(args.data_root, require_sst=args.recompute_sst)
+    curated_dir = args.curated_dir or args.base_frame.parent
+    sources = validate_sources(
+        args.data_root, args.base_frame, args.gmst_frame, curated_dir,
+        require_sst=args.recompute_sst,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
-    base = pd.read_csv(BASE_FRAME).set_index("year").sort_index()
+    base = pd.read_csv(args.base_frame).set_index("year").sort_index()
     metadata = {}
-    for name, path in SST_FILES.items():
+    forecast_inputs = None
+    if args.forecast_inputs is not None:
+        forecast_inputs = json.loads(args.forecast_inputs.read_text(encoding="utf-8"))
+    for name in SST_FILENAMES:
         destination = args.output / f"enso_predictors_{name}.csv"
         if destination.exists() and not args.overwrite:
             logging.info("Keeping existing %s", destination.name)
@@ -338,21 +477,38 @@ def main() -> None:
         if args.recompute_sst:
             frame, info = build_sst_frame(name, sources[name], base)
         else:
-            frame = pd.read_csv(CURATED_FRAMES[name]).set_index("year").sort_index()
+            frame = pd.read_csv(sources[f"curated_{name}"]).set_index("year").sort_index()
             info = {
                 "dataset": name,
                 "source": str(sources[name]),
-                "analysis_ready_table": str(CURATED_FRAMES[name]),
+                "analysis_ready_table": str(sources[f"curated_{name}"]),
                 "climatology": "1991-2020 monthly",
                 "years": "1982-2026",
                 "previous_1981_D0JF": PREVIOUS_1981[name],
             }
         frame.to_csv(destination, float_format="%.9g")
         metadata[name] = info
-    gmst_metadata = prepare_gmst_frame(args.output)
+    ersstv6_frame = pd.read_csv(args.output / "enso_predictors_ersstv6.csv").set_index("year").sort_index()
+    gmst_metadata = prepare_gmst_frame(
+        args.output, args.gmst_frame, ersstv6_frame,
+        PREVIOUS_1981["ersstv6"], args.gmst_source, forecast_inputs,
+        args.reporting_offset,
+    )
     metadata["_global"] = gmst_metadata
     (args.output / "processing_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    write_run_manifest(
+        args.output,
+        [args.base_frame, args.gmst_frame, args.gmst_source, args.forecast_inputs,
+         *[sources[f"curated_{name}"] for name in CURATED_FILENAMES]],
+        {
+            "climatology": "1991-2020",
+            "years": [1982, 2026],
+            "forecast_inputs_2027": forecast_inputs,
+            "reporting_offset_override": args.reporting_offset,
+            "retired_placeholder_guard": STALE_FORECAST_INPUTS_2027,
+        },
     )
     logging.info("Prepared tables written to %s", args.output)
 
